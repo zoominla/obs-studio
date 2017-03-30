@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include "config-file.h"
+#include "threading.h"
 #include "platform.h"
 #include "base.h"
 #include "bmem.h"
@@ -57,7 +58,18 @@ struct config_data {
 	char *file;
 	struct darray sections; /* struct config_section */
 	struct darray defaults; /* struct config_section */
+	pthread_mutex_t mutex;
 };
+
+static inline bool init_mutex(config_t *config)
+{
+	pthread_mutexattr_t attr;
+	if (pthread_mutexattr_init(&attr) != 0)
+		return false;
+	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
+		return false;
+	return pthread_mutex_init(&config->mutex, &attr) == 0;
+}
 
 config_t *config_create(const char *file)
 {
@@ -70,6 +82,12 @@ config_t *config_create(const char *file)
 	fclose(f);
 
 	config = bzalloc(sizeof(struct config_data));
+
+	if (!init_mutex(config)) {
+		bfree(config);
+		return NULL;
+	}
+
 	config->file = bstrdup(file);
 	return config;
 }
@@ -117,15 +135,42 @@ static bool config_parse_string(struct lexer *lex, struct strref *ref,
 	return success;
 }
 
+static void unescape(struct dstr *str)
+{
+	char *read = str->array;
+	char *write = str->array;
+
+	for (; *read; read++, write++) {
+		char cur = *read;
+		if (cur == '\\') {
+			char next = read[1];
+			if (next == '\\') {
+				read++;
+			} else if (next == 'r') {
+				cur = '\r';
+				read++;
+			} else if (next =='n') {
+				cur = '\n';
+				read++;
+			}
+		}
+
+		if (read != write)
+			*write = cur;
+	}
+
+	if (read != write)
+		*write = '\0';
+}
+
 static void config_add_item(struct darray *items, struct strref *name,
 		struct strref *value)
 {
 	struct config_item item;
 	struct dstr item_value;
 	dstr_init_copy_strref(&item_value, value);
-	dstr_replace(&item_value, "\\n", "\n");
-	dstr_replace(&item_value, "\\r", "\r");
-	dstr_replace(&item_value, "\\\\", "\\");
+
+	unescape(&item_value);
 
 	item.name  = bstrdup_n(name->array,  name->len);
 	item.value = item_value.array;
@@ -251,6 +296,11 @@ int config_open(config_t **config, const char *file,
 	if (!*config)
 		return CONFIG_ERROR;
 
+	if (!init_mutex(*config)) {
+		bfree(*config);
+		return CONFIG_ERROR;
+	}
+
 	(*config)->file = bstrdup(file);
 
 	errorcode = config_parse_file(&(*config)->sections, file, always_open);
@@ -273,6 +323,11 @@ int config_open_string(config_t **config, const char *str)
 	*config = bzalloc(sizeof(struct config_data));
 	if (!*config)
 		return CONFIG_ERROR;
+
+	if (!init_mutex(*config)) {
+		bfree(*config);
+		return CONFIG_ERROR;
+	}
 
 	(*config)->file = NULL;
 
@@ -306,9 +361,13 @@ int config_save(config_t *config)
 	dstr_init(&str);
 	dstr_init(&tmp);
 
+	pthread_mutex_lock(&config->mutex);
+
 	f = os_fopen(config->file, "wb");
-	if (!f)
+	if (!f) {
+		pthread_mutex_unlock(&config->mutex);
 		return CONFIG_FILENOTFOUND;
+	}
 
 	for (i = 0; i < config->sections.num; i++) {
 		struct config_section *section = darray_item(
@@ -344,6 +403,8 @@ int config_save(config_t *config)
 	fwrite(str.array, 1, str.len, f);
 	fclose(f);
 
+	pthread_mutex_unlock(&config->mutex);
+
 	dstr_free(&tmp);
 	dstr_free(&str);
 
@@ -363,6 +424,8 @@ int config_save_safe(config_t *config, const char *temp_ext,
 		                "temporary extension specified");
 		return CONFIG_ERROR;
 	}
+
+	pthread_mutex_lock(&config->mutex);
 
 	dstr_copy(&temp_file, config->file);
 	if (*temp_ext != '.')
@@ -392,6 +455,7 @@ int config_save_safe(config_t *config, const char *temp_ext,
 	os_rename(temp_file.array, file);
 
 cleanup:
+	pthread_mutex_unlock(&config->mutex);
 	dstr_free(&temp_file);
 	dstr_free(&backup_file);
 	return ret;
@@ -415,6 +479,7 @@ void config_close(config_t *config)
 	darray_free(&config->defaults);
 	darray_free(&config->sections);
 	bfree(config->file);
+	pthread_mutex_destroy(&config->mutex);
 	bfree(config);
 }
 
@@ -426,14 +491,20 @@ size_t config_num_sections(config_t *config)
 const char *config_get_section(config_t *config, size_t idx)
 {
 	struct config_section *section;
+	const char *name = NULL;
+
+	pthread_mutex_lock(&config->mutex);
 
 	if (idx >= config->sections.num)
-		return NULL;
+		goto unlock;
 
 	section = darray_item(sizeof(struct config_section), &config->sections,
 			idx);
+	name = section->name;
 
-	return section->name;
+unlock:
+	pthread_mutex_unlock(&config->mutex);
+	return name;
 }
 
 static const struct config_item *config_find_item(const struct darray *sections,
@@ -460,13 +531,15 @@ static const struct config_item *config_find_item(const struct darray *sections,
 	return NULL;
 }
 
-static void config_set_item(struct darray *sections, const char *section,
-		const char *name, char *value)
+static void config_set_item(config_t *config, struct darray *sections,
+		const char *section, const char *name, char *value)
 {
 	struct config_section *sec = NULL;
 	struct config_section *array = sections->array;
 	struct config_item *item;
 	size_t i, j;
+
+	pthread_mutex_lock(&config->mutex);
 
 	for (i = 0; i < sections->num; i++) {
 		struct config_section *cur_sec = array+i;
@@ -479,7 +552,7 @@ static void config_set_item(struct darray *sections, const char *section,
 				if (astrcmpi(item->name, name) == 0) {
 					bfree(item->value);
 					item->value = value;
-					return;
+					goto unlock;
 				}
 			}
 
@@ -497,6 +570,9 @@ static void config_set_item(struct darray *sections, const char *section,
 	item = darray_push_back_new(sizeof(struct config_item), &sec->items);
 	item->name  = bstrdup(name);
 	item->value = value;
+
+unlock:
+	pthread_mutex_unlock(&config->mutex);
 }
 
 void config_set_string(config_t *config, const char *section,
@@ -504,7 +580,8 @@ void config_set_string(config_t *config, const char *section,
 {
 	if (!value)
 		value = "";
-	config_set_item(&config->sections, section, name, bstrdup(value));
+	config_set_item(config, &config->sections, section, name,
+			bstrdup(value));
 }
 
 void config_set_int(config_t *config, const char *section,
@@ -513,7 +590,7 @@ void config_set_int(config_t *config, const char *section,
 	struct dstr str;
 	dstr_init(&str);
 	dstr_printf(&str, "%"PRId64, value);
-	config_set_item(&config->sections, section, name, str.array);
+	config_set_item(config, &config->sections, section, name, str.array);
 }
 
 void config_set_uint(config_t *config, const char *section,
@@ -522,14 +599,14 @@ void config_set_uint(config_t *config, const char *section,
 	struct dstr str;
 	dstr_init(&str);
 	dstr_printf(&str, "%"PRIu64, value);
-	config_set_item(&config->sections, section, name, str.array);
+	config_set_item(config, &config->sections, section, name, str.array);
 }
 
 void config_set_bool(config_t *config, const char *section,
 		const char *name, bool value)
 {
 	char *str = bstrdup(value ? "true" : "false");
-	config_set_item(&config->sections, section, name, str);
+	config_set_item(config, &config->sections, section, name, str);
 }
 
 void config_set_double(config_t *config, const char *section,
@@ -537,7 +614,7 @@ void config_set_double(config_t *config, const char *section,
 {
 	char *str = bzalloc(64);
 	os_dtostr(value, str, 64);
-	config_set_item(&config->sections, section, name, str);
+	config_set_item(config, &config->sections, section, name, str);
 }
 
 void config_set_default_string(config_t *config, const char *section,
@@ -545,7 +622,8 @@ void config_set_default_string(config_t *config, const char *section,
 {
 	if (!value)
 		value = "";
-	config_set_item(&config->defaults, section, name, bstrdup(value));
+	config_set_item(config, &config->defaults, section, name,
+			bstrdup(value));
 }
 
 void config_set_default_int(config_t *config, const char *section,
@@ -554,7 +632,7 @@ void config_set_default_int(config_t *config, const char *section,
 	struct dstr str;
 	dstr_init(&str);
 	dstr_printf(&str, "%"PRId64, value);
-	config_set_item(&config->defaults, section, name, str.array);
+	config_set_item(config, &config->defaults, section, name, str.array);
 }
 
 void config_set_default_uint(config_t *config, const char *section,
@@ -563,14 +641,14 @@ void config_set_default_uint(config_t *config, const char *section,
 	struct dstr str;
 	dstr_init(&str);
 	dstr_printf(&str, "%"PRIu64, value);
-	config_set_item(&config->defaults, section, name, str.array);
+	config_set_item(config, &config->defaults, section, name, str.array);
 }
 
 void config_set_default_bool(config_t *config, const char *section,
 		const char *name, bool value)
 {
 	char *str = bstrdup(value ? "true" : "false");
-	config_set_item(&config->defaults, section, name, str);
+	config_set_item(config, &config->defaults, section, name, str);
 }
 
 void config_set_default_double(config_t *config, const char *section,
@@ -579,20 +657,25 @@ void config_set_default_double(config_t *config, const char *section,
 	struct dstr str;
 	dstr_init(&str);
 	dstr_printf(&str, "%g", value);
-	config_set_item(&config->defaults, section, name, str.array);
+	config_set_item(config, &config->defaults, section, name, str.array);
 }
 
-const char *config_get_string(const config_t *config, const char *section,
+const char *config_get_string(config_t *config, const char *section,
 		const char *name)
 {
-	const struct config_item *item = config_find_item(&config->sections,
-			section, name);
+	const struct config_item *item;
+	const char *value = NULL;
+
+	pthread_mutex_lock(&config->mutex);
+
+	item = config_find_item(&config->sections, section, name);
 	if (!item)
 		item = config_find_item(&config->defaults, section, name);
-	if (!item)
-		return NULL;
+	if (item)
+		value = item->value;
 
-	return item->value;
+	pthread_mutex_unlock(&config->mutex);
+	return value;
 }
 
 static inline int64_t str_to_int64(const char *str)
@@ -617,7 +700,7 @@ static inline uint64_t str_to_uint64(const char *str)
 		return strtoull(str, NULL, 10);
 }
 
-int64_t config_get_int(const config_t *config, const char *section,
+int64_t config_get_int(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_string(config, section, name);
@@ -627,7 +710,7 @@ int64_t config_get_int(const config_t *config, const char *section,
 	return 0;
 }
 
-uint64_t config_get_uint(const config_t *config, const char *section,
+uint64_t config_get_uint(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_string(config, section, name);
@@ -637,7 +720,7 @@ uint64_t config_get_uint(const config_t *config, const char *section,
 	return 0;
 }
 
-bool config_get_bool(const config_t *config, const char *section,
+bool config_get_bool(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_string(config, section, name);
@@ -648,7 +731,7 @@ bool config_get_bool(const config_t *config, const char *section,
 	return false;
 }
 
-double config_get_double(const config_t *config, const char *section,
+double config_get_double(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_string(config, section, name);
@@ -662,6 +745,9 @@ bool config_remove_value(config_t *config, const char *section,
 		const char *name)
 {
 	struct darray *sections = &config->sections;
+	bool success = false;
+
+	pthread_mutex_lock(&config->mutex);
 
 	for (size_t i = 0; i < sections->num; i++) {
 		struct config_section *sec = darray_item(
@@ -679,27 +765,34 @@ bool config_remove_value(config_t *config, const char *section,
 				config_item_free(item);
 				darray_erase(sizeof(struct config_item),
 						&sec->items, j);
-				return true;
+				success = true;
+				goto unlock;
 			}
 		}
 	}
 
-	return false;
+unlock:
+	pthread_mutex_unlock(&config->mutex);
+	return success;
 }
 
-const char *config_get_default_string(const config_t *config,
+const char *config_get_default_string(config_t *config,
 		const char *section, const char *name)
 {
 	const struct config_item *item;
+	const char *value = NULL;
+
+	pthread_mutex_lock(&config->mutex);
 
 	item = config_find_item(&config->defaults, section, name);
-	if (!item)
-		return NULL;
+	if (item)
+		value = item->value;
 
-	return item->value;
+	pthread_mutex_unlock(&config->mutex);
+	return value;
 }
 
-int64_t config_get_default_int(const config_t *config, const char *section,
+int64_t config_get_default_int(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
@@ -709,7 +802,7 @@ int64_t config_get_default_int(const config_t *config, const char *section,
 	return 0;
 }
 
-uint64_t config_get_default_uint(const config_t *config, const char *section,
+uint64_t config_get_default_uint(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
@@ -719,7 +812,7 @@ uint64_t config_get_default_uint(const config_t *config, const char *section,
 	return 0;
 }
 
-bool config_get_default_bool(const config_t *config, const char *section,
+bool config_get_default_bool(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
@@ -730,7 +823,7 @@ bool config_get_default_bool(const config_t *config, const char *section,
 	return false;
 }
 
-double config_get_default_double(const config_t *config, const char *section,
+double config_get_default_double(config_t *config, const char *section,
 		const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
@@ -740,15 +833,23 @@ double config_get_default_double(const config_t *config, const char *section,
 	return 0.0;
 }
 
-bool config_has_user_value(const config_t *config, const char *section,
+bool config_has_user_value(config_t *config, const char *section,
 		const char *name)
 {
-	return config_find_item(&config->sections, section, name) != NULL;
+	bool success;
+	pthread_mutex_lock(&config->mutex);
+	success = config_find_item(&config->sections, section, name) != NULL;
+	pthread_mutex_unlock(&config->mutex);
+	return success;
 }
 
-bool config_has_default_value(const config_t *config, const char *section,
+bool config_has_default_value(config_t *config, const char *section,
 		const char *name)
 {
-	return config_find_item(&config->defaults, section, name) != NULL;
+	bool success;
+	pthread_mutex_lock(&config->mutex);
+	success = config_find_item(&config->defaults, section, name) != NULL;
+	pthread_mutex_unlock(&config->mutex);
+	return success;
 }
 

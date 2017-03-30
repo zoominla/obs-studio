@@ -1,6 +1,8 @@
 #include <obs-module.h>
 #include <util/darray.h>
+#include <util/platform.h>
 #include <libavutil/log.h>
+#include <libavcodec/avcodec.h>
 #include <pthread.h>
 
 OBS_DECLARE_MODULE()
@@ -9,7 +11,9 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-ffmpeg", "en-US")
 extern struct obs_source_info  ffmpeg_source;
 extern struct obs_output_info  ffmpeg_output;
 extern struct obs_output_info  ffmpeg_muxer;
+extern struct obs_output_info  replay_buffer;
 extern struct obs_encoder_info aac_encoder_info;
+extern struct obs_encoder_info nvenc_encoder_info;
 
 static DARRAY(struct log_context {
 	void *context;
@@ -36,7 +40,6 @@ static struct log_context *create_or_fetch_log_context(void *context)
 		new_log_context = cached_log_contexts.array[cnt - 1];
 		da_pop_back(cached_log_contexts);
 	}
-	pthread_mutex_unlock(&log_contexts_mutex);
 
 	if (!new_log_context)
 		new_log_context = bzalloc(sizeof(struct log_context));
@@ -46,6 +49,8 @@ static struct log_context *create_or_fetch_log_context(void *context)
 	new_log_context->print_prefix = 1;
 
 	da_push_back(active_log_contexts, &new_log_context);
+
+	pthread_mutex_unlock(&log_contexts_mutex);
 
 	return new_log_context;
 }
@@ -110,17 +115,43 @@ cleanup:
 	destroy_log_context(log_context);
 }
 
+static bool nvenc_supported(void)
+{
+	AVCodec *nvenc = avcodec_find_encoder_by_name("nvenc_h264");
+	void *lib = NULL;
+
+	if (!nvenc)
+		return false;
+
+#if defined(_WIN32)
+	if (sizeof(void*) == 8) {
+		lib = os_dlopen("nvEncodeAPI64.dll");
+	} else {
+		lib = os_dlopen("nvEncodeAPI.dll");
+	}
+#else
+	lib = os_dlopen("libnvidia-encode.so.1");
+#endif
+	os_dlclose(lib);
+	return !!lib;
+}
+
 bool obs_module_load(void)
 {
 	da_init(active_log_contexts);
 	da_init(cached_log_contexts);
 
-	av_log_set_callback(ffmpeg_log_callback);
+	//av_log_set_callback(ffmpeg_log_callback);
 
 	obs_register_source(&ffmpeg_source);
 	obs_register_output(&ffmpeg_output);
 	obs_register_output(&ffmpeg_muxer);
+	obs_register_output(&replay_buffer);
 	obs_register_encoder(&aac_encoder_info);
+	if (nvenc_supported()) {
+		blog(LOG_INFO, "NVENC supported");
+		obs_register_encoder(&nvenc_encoder_info);
+	}
 	return true;
 }
 

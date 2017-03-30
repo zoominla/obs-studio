@@ -542,11 +542,13 @@ void RegisterMFH264Encoders()
 		if (!CanSpawnEncoder(e))
 			continue;
 
+		info.caps = OBS_ENCODER_CAP_DEPRECATED;
 		info.id = e->Id();
 		info.type_data = new TypeData(e);
 		info.free_type_data = [] (void *type_data) {
 			delete reinterpret_cast<TypeData*>(type_data);
 		};
+
 		obs_register_encoder(&info);
 	}
 }

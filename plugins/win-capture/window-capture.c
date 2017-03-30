@@ -118,7 +118,7 @@ static obs_properties_t *wc_properties(void *unused)
 
 	p = obs_properties_add_list(ppts, "window", TEXT_WINDOW,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	fill_window_list(p, EXCLUDE_MINIMIZED);
+	fill_window_list(p, EXCLUDE_MINIMIZED, NULL);
 
 	p = obs_properties_add_list(ppts, "priority", TEXT_MATCH_PRIORITY,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -150,8 +150,11 @@ static void wc_tick(void *data, float seconds)
 
 		wc->window = find_window(EXCLUDE_MINIMIZED, wc->priority,
 				wc->class, wc->title, wc->executable);
-		if (!wc->window)
+		if (!wc->window) {
+			if (wc->capture.valid)
+				dc_capture_free(&wc->capture);
 			return;
+		}
 
 		reset_capture = true;
 
@@ -190,7 +193,7 @@ static void wc_tick(void *data, float seconds)
 static void wc_render(void *data, gs_effect_t *effect)
 {
 	struct window_capture *wc = data;
-	dc_capture_render(&wc->capture, obs_get_opaque_effect());
+	dc_capture_render(&wc->capture, obs_get_base_effect(OBS_EFFECT_OPAQUE));
 
 	UNUSED_PARAMETER(effect);
 }

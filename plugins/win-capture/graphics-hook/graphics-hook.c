@@ -1,4 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <psapi.h>
 #include "graphics-hook.h"
@@ -32,14 +31,17 @@ HANDLE                         signal_restart                  = NULL;
 HANDLE                         signal_stop                     = NULL;
 HANDLE                         signal_ready                    = NULL;
 HANDLE                         signal_exit                     = NULL;
+static HANDLE                  signal_init                     = NULL;
 HANDLE                         tex_mutexes[2]                  = {NULL, NULL};
 static HANDLE                  filemap_hook_info               = NULL;
 
+static HINSTANCE               dll_inst                        = NULL;
 static volatile bool           stop_loop                       = false;
 static HANDLE                  capture_thread                  = NULL;
 char                           system_path[MAX_PATH]           = {0};
 char                           process_name[MAX_PATH]          = {0};
-char                           keepalive_name[64]              = {0};
+wchar_t                        keepalive_name[64]              = {0};
+HWND                           dummy_window                    = NULL;
 
 static unsigned int            shmem_id_counter                = 0;
 static void                    *shmem_info                     = NULL;
@@ -49,6 +51,7 @@ static struct thread_data      thread_data                     = {0};
 
 volatile bool                  active                          = false;
 struct hook_info               *global_hook_info               = NULL;
+
 
 static inline void wait_for_dll_main_finish(HANDLE thread_handle)
 {
@@ -71,22 +74,17 @@ bool init_pipe(void)
 	return true;
 }
 
-static HANDLE init_event(const char *name, DWORD pid)
+static HANDLE init_event(const wchar_t *name, DWORD pid)
 {
-	HANDLE handle = get_event_plus_id(name, pid);
+	HANDLE handle = create_event_plus_id(name, pid);
 	if (!handle)
 		hlog("Failed to get event '%s': %lu", name, GetLastError());
 	return handle;
 }
 
-static HANDLE init_mutex(const char *name, DWORD pid)
+static HANDLE init_mutex(const wchar_t *name, DWORD pid)
 {
-	char new_name[64];
-	HANDLE handle;
-
-	sprintf(new_name, "%s%lu", name, pid);
-
-	handle = OpenMutexA(MUTEX_ALL_ACCESS, false, new_name);
+	HANDLE handle = create_mutex_plus_id(name, pid);
 	if (!handle)
 		hlog("Failed to open mutex '%s': %lu", name, GetLastError());
 	return handle;
@@ -113,6 +111,11 @@ static inline bool init_signals(void)
 
 	signal_exit = init_event(EVENT_HOOK_EXIT, pid);
 	if (!signal_exit) {
+		return false;
+	}
+
+	signal_init = init_event(EVENT_HOOK_INIT, pid);
+	if (!signal_init) {
 		return false;
 	}
 
@@ -161,7 +164,7 @@ static inline void log_current_process(void)
 
 static inline bool init_hook_info(void)
 {
-	filemap_hook_info = get_hook_info(GetCurrentProcessId());
+	filemap_hook_info = create_hook_info(GetCurrentProcessId());
 	if (!filemap_hook_info) {
 		hlog("Failed to create hook info file mapping: %lu",
 				GetLastError());
@@ -179,29 +182,65 @@ static inline bool init_hook_info(void)
 	return true;
 }
 
+#define DEF_FLAGS (WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS)
+
+static DWORD WINAPI dummy_window_thread(LPVOID *unused)
+{
+	static const wchar_t dummy_window_class[] = L"temp_d3d_window_4039785";
+	WNDCLASSW wc;
+	MSG msg;
+
+	memset(&wc, 0, sizeof(wc));
+	wc.style = CS_OWNDC;
+	wc.hInstance = dll_inst;
+	wc.lpfnWndProc = (WNDPROC)DefWindowProc;
+	wc.lpszClassName = dummy_window_class;
+
+	if (!RegisterClass(&wc)) {
+		hlog("Failed to create temp D3D window class: %lu",
+				GetLastError());
+		return 0;
+	}
+
+	dummy_window = CreateWindowExW(0, dummy_window_class, L"Temp Window",
+			DEF_FLAGS, 0, 0, 1, 1, NULL, NULL, dll_inst, NULL);
+	if (!dummy_window) {
+		hlog("Failed to create temp D3D window: %lu", GetLastError());
+		return 0;
+	}
+
+	while (GetMessage(&msg, NULL, 0, 0)) {
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	(void)unused;
+	return 0;
+}
+
+static inline void init_dummy_window_thread(void)
+{
+	HANDLE thread = CreateThread(NULL, 0, dummy_window_thread, NULL, 0,
+			NULL);
+	if (!thread) {
+		hlog("Failed to create temp D3D window thread: %lu",
+				GetLastError());
+		return;
+	}
+
+	CloseHandle(thread);
+}
+
 static inline bool init_hook(HANDLE thread_handle)
 {
 	wait_for_dll_main_finish(thread_handle);
 
-	sprintf(keepalive_name, "%s%lu", EVENT_HOOK_KEEPALIVE,
-			GetCurrentProcessId());
+	_snwprintf(keepalive_name, sizeof(keepalive_name) / sizeof(wchar_t),
+			L"%s%lu", WINDOW_HOOK_KEEPALIVE, GetCurrentProcessId());
 
-	if (!init_pipe()) {
-		return false;
-	}
-	if (!init_signals()) {
-		return false;
-	}
-	if (!init_mutexes()) {
-		return false;
-	}
-	if (!init_system_path()) {
-		return false;
-	}
-	if (!init_hook_info()) {
-		return false;
-	}
+	init_pipe();
 
+	init_dummy_window_thread();
 	log_current_process();
 
 	SetEvent(signal_restart);
@@ -238,8 +277,7 @@ static void free_hook(void)
 
 static inline bool d3d8_hookable(void)
 {
-	return !!global_hook_info->offsets.d3d8.present &&
-		!!global_hook_info->offsets.d3d8.reset;
+	return !!global_hook_info->offsets.d3d8.present;
 }
 
 static inline bool ddraw_hookable(void)
@@ -258,9 +296,7 @@ static inline bool d3d9_hookable(void)
 {
 	return !!global_hook_info->offsets.d3d9.present &&
 		!!global_hook_info->offsets.d3d9.present_ex &&
-		!!global_hook_info->offsets.d3d9.present_swap &&
-		!!global_hook_info->offsets.d3d9.reset &&
-		!!global_hook_info->offsets.d3d9.reset_ex;
+		!!global_hook_info->offsets.d3d9.present_swap;
 }
 
 static inline bool dxgi_hookable(void)
@@ -279,6 +315,7 @@ static inline bool attempt_hook(void)
 
 	if (!d3d9_hooked) {
 		if (!d3d9_hookable()) {
+			DbgOut("no D3D9 hook address found!\n");
 			d3d9_hooked = true;
 		} else {
 			d3d9_hooked = hook_d3d9();
@@ -290,6 +327,7 @@ static inline bool attempt_hook(void)
 
 	if (!dxgi_hooked) {
 		if (!dxgi_hookable()) {
+			DbgOut("no DXGI hook address found!\n");
 			dxgi_hooked = true;
 		} else {
 			dxgi_hooked = hook_dxgi();
@@ -335,6 +373,8 @@ static inline bool attempt_hook(void)
 
 static inline void capture_loop(void)
 {
+	WaitForSingleObject(signal_init, INFINITE);
+
 	while (!attempt_hook())
 		Sleep(40);
 
@@ -446,10 +486,10 @@ static inline void unlock_shmem_tex(int id)
 
 static inline bool init_shared_info(size_t size)
 {
-	char name[64];
-	sprintf_s(name, 64, "%s%u", SHMEM_TEXTURE, ++shmem_id_counter);
+	wchar_t name[64];
+	_snwprintf(name, 64, L"%s%ld", SHMEM_TEXTURE, ++shmem_id_counter);
 
-	shmem_file_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+	shmem_file_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
 			PAGE_READWRITE, 0, (DWORD)size, name);
 	if (!shmem_file_handle) {
 		hlog("init_shared_info: Failed to create shared memory: %d",
@@ -740,8 +780,29 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID unused1)
 	if (reason == DLL_PROCESS_ATTACH) {
 		wchar_t name[MAX_PATH];
 
-		HANDLE cur_thread = OpenThread(THREAD_ALL_ACCESS, false,
-				GetCurrentThreadId());
+		dll_inst = hinst;
+
+		HANDLE cur_thread;
+		bool success = DuplicateHandle(GetCurrentProcess(),
+				GetCurrentThread(),
+				GetCurrentProcess(), &cur_thread,
+				SYNCHRONIZE, false, 0);
+
+		if (!success)
+			DbgOut("Failed to get current thread handle");
+
+		if (!init_signals()) {
+			return false;
+		}
+		if (!init_system_path()) {
+			return false;
+		}
+		if (!init_hook_info()) {
+			return false;
+		}
+		if (!init_mutexes()) {
+			return false;
+		}
 
 		/* this prevents the library from being automatically unloaded
 		 * by the next FreeLibrary call */

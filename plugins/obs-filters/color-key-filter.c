@@ -132,7 +132,7 @@ static void *color_key_create(obs_data_t *settings, obs_source_t *context)
 	obs_enter_graphics();
 
 	filter->effect = gs_effect_create_from_file(effect_path, NULL);
-	if (filter) {
+	if (filter->effect) {
 		filter->color_param = gs_effect_get_param_by_name(
 				filter->effect, "color");
 		filter->contrast_param = gs_effect_get_param_by_name(
@@ -166,8 +166,9 @@ static void color_key_render(void *data, gs_effect_t *effect)
 {
 	struct color_key_filter_data *filter = data;
 
-	obs_source_process_filter_begin(filter->context, GS_RGBA,
-			OBS_ALLOW_DIRECT_RENDERING);
+	if (!obs_source_process_filter_begin(filter->context, GS_RGBA,
+				OBS_ALLOW_DIRECT_RENDERING))
+		return;
 
 	gs_effect_set_vec4(filter->color_param, &filter->color);
 	gs_effect_set_float(filter->contrast_param, filter->contrast);

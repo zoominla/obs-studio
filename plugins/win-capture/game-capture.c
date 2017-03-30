@@ -1,6 +1,8 @@
 #include <inttypes.h>
 #include <obs-module.h>
+#include <obs-hotkey.h>
 #include <util/platform.h>
+#include <util/threading.h>
 #include <windows.h>
 #include <dxgi.h>
 #include <emmintrin.h>
@@ -10,6 +12,8 @@
 #include "graphics-hook-info.h"
 #include "window-helpers.h"
 #include "cursor-capture.h"
+#include "app-helpers.h"
+#include "nt-stuff.h"
 
 #define do_log(level, format, ...) \
 	blog(level, "[game-capture: '%s'] " format, \
@@ -19,7 +23,7 @@
 #define info(format, ...)  do_log(LOG_INFO,    format, ##__VA_ARGS__)
 #define debug(format, ...) do_log(LOG_DEBUG,   format, ##__VA_ARGS__)
 
-#define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
+#define SETTING_MODE             "capture_mode"
 #define SETTING_CAPTURE_WINDOW   "window"
 #define SETTING_ACTIVE_WINDOW    "active_window"
 #define SETTING_WINDOW_PRIORITY  "priority"
@@ -32,6 +36,17 @@
 #define SETTING_CAPTURE_OVERLAYS "capture_overlays"
 #define SETTING_ANTI_CHEAT_HOOK  "anti_cheat_hook"
 
+/* deprecated */
+#define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
+
+#define SETTING_MODE_ANY         "any_fullscreen"
+#define SETTING_MODE_WINDOW      "window"
+#define SETTING_MODE_HOTKEY      "hotkey"
+
+#define HOTKEY_START             "hotkey_start"
+#define HOTKEY_STOP              "hotkey_stop"
+
+#define TEXT_MODE                obs_module_text("Mode")
 #define TEXT_GAME_CAPTURE        obs_module_text("GameCapture")
 #define TEXT_ANY_FULLSCREEN      obs_module_text("GameCapture.AnyFullscreen")
 #define TEXT_SLI_COMPATIBILITY   obs_module_text("Compatibility")
@@ -48,19 +63,32 @@
 #define TEXT_CAPTURE_OVERLAYS    obs_module_text("GameCapture.CaptureOverlays")
 #define TEXT_ANTI_CHEAT_HOOK     obs_module_text("GameCapture.AntiCheatHook")
 
+#define TEXT_MODE_ANY            TEXT_ANY_FULLSCREEN
+#define TEXT_MODE_WINDOW         obs_module_text("GameCapture.CaptureWindow")
+#define TEXT_MODE_HOTKEY         obs_module_text("GameCapture.UseHotkey")
+
+#define TEXT_HOTKEY_START        obs_module_text("GameCapture.HotkeyStart")
+#define TEXT_HOTKEY_STOP         obs_module_text("GameCapture.HotkeyStop")
+
 #define DEFAULT_RETRY_INTERVAL 2.0f
 #define ERROR_RETRY_INTERVAL 4.0f
+
+enum capture_mode {
+	CAPTURE_MODE_ANY,
+	CAPTURE_MODE_WINDOW,
+	CAPTURE_MODE_HOTKEY
+};
 
 struct game_capture_config {
 	char                          *title;
 	char                          *class;
 	char                          *executable;
 	enum window_priority          priority;
+	enum capture_mode             mode;
 	uint32_t                      scale_cx;
 	uint32_t                      scale_cy;
 	bool                          cursor : 1;
 	bool                          force_shmem : 1;
-	bool                          capture_any_fullscreen : 1;
 	bool                          force_scaling : 1;
 	bool                          allow_transparency : 1;
 	bool                          limit_framerate : 1;
@@ -83,7 +111,16 @@ struct game_capture {
 	float                         retry_time;
 	float                         fps_reset_time;
 	float                         retry_interval;
+	struct dstr                   title;
+	struct dstr                   class;
+	struct dstr                   executable;
+	enum window_priority          priority;
+	obs_hotkey_pair_id            hotkey_pair;
+	volatile long                 hotkey_window;
+	volatile bool                 deactivate_hook;
+	volatile bool                 activate_hook_now;
 	bool                          wait_for_target_startup : 1;
+	bool                          showing : 1;
 	bool                          active : 1;
 	bool                          capturing : 1;
 	bool                          activate_hook : 1;
@@ -92,13 +129,15 @@ struct game_capture {
 	bool                          dwm_capture : 1;
 	bool                          initial_config : 1;
 	bool                          convert_16bit : 1;
+	bool                          is_app : 1;
 
 	struct game_capture_config    config;
 
 	ipc_pipe_server_t             pipe;
 	gs_texture_t                  *texture;
 	struct hook_info              *global_hook_info;
-	HANDLE                        keep_alive;
+	HANDLE                        keepalive_mutex;
+	HANDLE                        hook_init;
 	HANDLE                        hook_restart;
 	HANDLE                        hook_stop;
 	HANDLE                        hook_ready;
@@ -107,6 +146,8 @@ struct game_capture {
 	HANDLE                        global_hook_info_map;
 	HANDLE                        target_process;
 	HANDLE                        texture_mutexes[2];
+	wchar_t                       *app_sid;
+	int                           retrying;
 
 	union {
 		struct {
@@ -123,6 +164,61 @@ struct game_capture {
 
 struct graphics_offsets offsets32 = {0};
 struct graphics_offsets offsets64 = {0};
+
+static inline bool use_anticheat(struct game_capture *gc)
+{
+	return gc->config.anticheat_hook && !gc->is_app;
+}
+
+static inline HANDLE open_mutex_plus_id(struct game_capture *gc,
+		const wchar_t *name, DWORD id)
+{
+	wchar_t new_name[64];
+	_snwprintf(new_name, 64, L"%s%lu", name, id);
+	return gc->is_app
+		? open_app_mutex(gc->app_sid, new_name)
+		: open_mutex(new_name);
+}
+
+static inline HANDLE open_mutex_gc(struct game_capture *gc,
+		const wchar_t *name)
+{
+	return open_mutex_plus_id(gc, name, gc->process_id);
+}
+
+static inline HANDLE open_event_plus_id(struct game_capture *gc,
+		const wchar_t *name, DWORD id)
+{
+	wchar_t new_name[64];
+	_snwprintf(new_name, 64, L"%s%lu", name, id);
+	return gc->is_app
+		? open_app_event(gc->app_sid, new_name)
+		: open_event(new_name);
+}
+
+static inline HANDLE open_event_gc(struct game_capture *gc,
+		const wchar_t *name)
+{
+	return open_event_plus_id(gc, name, gc->process_id);
+}
+
+static inline HANDLE open_map_plus_id(struct game_capture *gc,
+		const wchar_t *name, DWORD id)
+{
+	wchar_t new_name[64];
+	_snwprintf(new_name, 64, L"%s%lu", name, id);
+
+	debug("map id: %S", new_name);
+
+	return gc->is_app
+		? open_app_map(gc->app_sid, new_name)
+		: OpenFileMappingW(GC_MAPPING_FLAGS, false, new_name);
+}
+
+static inline HANDLE open_hook_info(struct game_capture *gc)
+{
+	return open_map_plus_id(gc, SHMEM_HOOK_INFO, gc->process_id);
+}
 
 static inline enum gs_color_format convert_format(uint32_t format)
 {
@@ -184,12 +280,18 @@ static void stop_capture(struct game_capture *gc)
 		gc->data = NULL;
 	}
 
-	close_handle(&gc->keep_alive);
+	if (gc->app_sid) {
+		LocalFree(gc->app_sid);
+		gc->app_sid = NULL;
+	}
+
 	close_handle(&gc->hook_restart);
 	close_handle(&gc->hook_stop);
 	close_handle(&gc->hook_ready);
 	close_handle(&gc->hook_exit);
+	close_handle(&gc->hook_init);
 	close_handle(&gc->hook_data_map);
+	close_handle(&gc->keepalive_mutex);
 	close_handle(&gc->global_hook_info_map);
 	close_handle(&gc->target_process);
 	close_handle(&gc->texture_mutexes[0]);
@@ -202,10 +304,16 @@ static void stop_capture(struct game_capture *gc)
 		gc->texture = NULL;
 	}
 
+	if (gc->active)
+		info("capture stopped");
+
 	gc->copy_texture = NULL;
 	gc->wait_for_target_startup = false;
 	gc->active = false;
 	gc->capturing = false;
+
+	if (gc->retrying)
+		gc->retrying--;
 }
 
 static inline void free_config(struct game_capture_config *config)
@@ -221,12 +329,24 @@ static void game_capture_destroy(void *data)
 	struct game_capture *gc = data;
 	stop_capture(gc);
 
+	if (gc->hotkey_pair)
+		obs_hotkey_pair_unregister(gc->hotkey_pair);
+
 	obs_enter_graphics();
 	cursor_data_free(&gc->cursor_data);
 	obs_leave_graphics();
 
+	dstr_free(&gc->title);
+	dstr_free(&gc->class);
+	dstr_free(&gc->executable);
 	free_config(&gc->config);
 	bfree(gc);
+}
+
+static inline bool using_older_non_mode_format(obs_data_t *settings)
+{
+	return obs_data_has_user_value(settings, SETTING_ANY_FULLSCREEN) &&
+		!obs_data_has_user_value(settings, SETTING_MODE);
 }
 
 static inline void get_config(struct game_capture_config *cfg,
@@ -234,12 +354,25 @@ static inline void get_config(struct game_capture_config *cfg,
 {
 	int ret;
 	const char *scale_str;
+	const char *mode_str = NULL;
 
 	build_window_strings(window, &cfg->class, &cfg->title,
 			&cfg->executable);
 
-	cfg->capture_any_fullscreen = obs_data_get_bool(settings,
-			SETTING_ANY_FULLSCREEN);
+	if (using_older_non_mode_format(settings)) {
+		bool any = obs_data_get_bool(settings, SETTING_ANY_FULLSCREEN);
+		mode_str = any ? SETTING_MODE_ANY : SETTING_MODE_WINDOW;
+	} else {
+		mode_str = obs_data_get_string(settings, SETTING_MODE);
+	}
+
+	if (mode_str && strcmp(mode_str, SETTING_MODE_WINDOW) == 0)
+		cfg->mode = CAPTURE_MODE_WINDOW;
+	else if (mode_str && strcmp(mode_str, SETTING_MODE_HOTKEY) == 0)
+		cfg->mode = CAPTURE_MODE_HOTKEY;
+	else
+		cfg->mode = CAPTURE_MODE_ANY;
+
 	cfg->priority = (enum window_priority)obs_data_get_int(settings,
 			SETTING_WINDOW_PRIORITY);
 	cfg->force_shmem = obs_data_get_bool(settings,
@@ -282,10 +415,10 @@ static inline int s_cmp(const char *str1, const char *str2)
 static inline bool capture_needs_reset(struct game_capture_config *cfg1,
 		struct game_capture_config *cfg2)
 {
-	if (cfg1->capture_any_fullscreen != cfg2->capture_any_fullscreen) {
+	if (cfg1->mode != cfg2->mode) {
 		return true;
 
-	} else if (!cfg1->capture_any_fullscreen &&
+	} else if (cfg1->mode == CAPTURE_MODE_WINDOW &&
 			(s_cmp(cfg1->class, cfg2->class) != 0 ||
 			 s_cmp(cfg1->title, cfg2->title) != 0 ||
 			 s_cmp(cfg1->executable, cfg2->executable) != 0 ||
@@ -313,6 +446,35 @@ static inline bool capture_needs_reset(struct game_capture_config *cfg1,
 	return false;
 }
 
+static bool hotkey_start(void *data, obs_hotkey_pair_id id,
+		obs_hotkey_t *hotkey, bool pressed)
+{
+	struct game_capture *gc = data;
+
+	if (pressed && gc->config.mode == CAPTURE_MODE_HOTKEY) {
+		info("Activate hotkey pressed");
+		os_atomic_set_long(&gc->hotkey_window,
+				(long)GetForegroundWindow());
+		os_atomic_set_bool(&gc->deactivate_hook, true);
+		os_atomic_set_bool(&gc->activate_hook_now, true);
+	}
+
+	return true;
+}
+
+static bool hotkey_stop(void *data, obs_hotkey_pair_id id,
+		obs_hotkey_t *hotkey, bool pressed)
+{
+	struct game_capture *gc = data;
+
+	if (pressed && gc->config.mode == CAPTURE_MODE_HOTKEY) {
+		info("Deactivate hotkey pressed");
+		os_atomic_set_bool(&gc->deactivate_hook, true);
+	}
+
+	return true;
+}
+
 static void game_capture_update(void *data, obs_data_t *settings)
 {
 	struct game_capture *gc = data;
@@ -331,10 +493,28 @@ static void game_capture_update(void *data, obs_data_t *settings)
 		gc->error_acquiring = false;
 	}
 
+	if (cfg.mode == CAPTURE_MODE_HOTKEY &&
+	    gc->config.mode != CAPTURE_MODE_HOTKEY) {
+		gc->activate_hook = false;
+	} else {
+		gc->activate_hook = !!window && !!*window;
+	}
+
 	free_config(&gc->config);
 	gc->config = cfg;
-	gc->activate_hook = !!window && !!*window;
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL;
+	gc->wait_for_target_startup = false;
+
+	dstr_free(&gc->title);
+	dstr_free(&gc->class);
+	dstr_free(&gc->executable);
+
+	if (cfg.mode == CAPTURE_MODE_WINDOW) {
+		dstr_copy(&gc->title, gc->config.title);
+		dstr_copy(&gc->class, gc->config.class);
+		dstr_copy(&gc->executable, gc->config.executable);
+		gc->priority = gc->config.priority;
+	}
 
 	if (!gc->initial_config) {
 		if (reset_capture) {
@@ -345,30 +525,25 @@ static void game_capture_update(void *data, obs_data_t *settings)
 	}
 }
 
+extern void wait_for_hook_initialization(void);
+
 static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct game_capture *gc = bzalloc(sizeof(*gc));
+
+	wait_for_hook_initialization();
+
 	gc->source = source;
 	gc->initial_config = true;
 	gc->retry_interval = DEFAULT_RETRY_INTERVAL;
+	gc->hotkey_pair = obs_hotkey_pair_register_source(
+			gc->source,
+			HOTKEY_START, TEXT_HOTKEY_START,
+			HOTKEY_STOP,  TEXT_HOTKEY_STOP,
+			hotkey_start, hotkey_stop, gc, gc);
 
 	game_capture_update(gc, settings);
 	return gc;
-}
-
-static inline HANDLE create_event_id(bool manual_reset, bool initial_state,
-		const char *name, DWORD process_id)
-{
-	char new_name[128];
-	sprintf(new_name, "%s%lu", name, process_id);
-	return CreateEventA(NULL, manual_reset, initial_state, new_name);
-}
-
-static inline HANDLE open_event_id(const char *name, DWORD process_id)
-{
-	char new_name[128];
-	sprintf(new_name, "%s%lu", name, process_id);
-	return OpenEventA(EVENT_ALL_ACCESS, false, new_name);
 }
 
 #define STOP_BEING_BAD \
@@ -381,14 +556,22 @@ static bool check_file_integrity(struct game_capture *gc, const char *file,
 {
 	DWORD error;
 	HANDLE handle;
+	wchar_t *w_file = NULL;
 
 	if (!file || !*file) {
 		warn("Game capture %s not found." STOP_BEING_BAD, name);
 		return false;
 	}
 
-	handle = CreateFileA(file, GENERIC_READ | GENERIC_EXECUTE,
+	if (!os_utf8_to_wcs_ptr(file, 0, &w_file)) {
+		warn("Could not convert file name to wide string");
+		return false;
+	}
+
+	handle = CreateFileW(w_file, GENERIC_READ | GENERIC_EXECUTE,
 			FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+
+	bfree(w_file);
 
 	if (handle != INVALID_HANDLE_VALUE) {
 		CloseHandle(handle);
@@ -445,15 +628,22 @@ static inline bool open_target_process(struct game_capture *gc)
 	}
 
 	gc->process_is_64bit = is_64bit_process(gc->target_process);
+	gc->is_app = is_app(gc->target_process);
+	if (gc->is_app) {
+		gc->app_sid = get_app_sid(gc->target_process);
+	}
 	return true;
 }
 
 static inline bool init_keepalive(struct game_capture *gc)
 {
-	gc->keep_alive = create_event_id(false, false, EVENT_HOOK_KEEPALIVE,
+	wchar_t new_name[64];
+	_snwprintf(new_name, 64, L"%s%lu", WINDOW_HOOK_KEEPALIVE,
 			gc->process_id);
-	if (!gc->keep_alive) {
-		warn("failed to create keepalive event");
+
+	gc->keepalive_mutex = CreateMutexW(NULL, false, new_name);
+	if (!gc->keepalive_mutex) {
+		warn("Failed to create keepalive mutex: %lu", GetLastError());
 		return false;
 	}
 
@@ -462,13 +652,20 @@ static inline bool init_keepalive(struct game_capture *gc)
 
 static inline bool init_texture_mutexes(struct game_capture *gc)
 {
-	gc->texture_mutexes[0] = get_mutex_plus_id(MUTEX_TEXTURE1,
-			gc->process_id);
-	gc->texture_mutexes[1] = get_mutex_plus_id(MUTEX_TEXTURE2,
-			gc->process_id);
+	gc->texture_mutexes[0] = open_mutex_gc(gc, MUTEX_TEXTURE1);
+	gc->texture_mutexes[1] = open_mutex_gc(gc, MUTEX_TEXTURE2);
 
 	if (!gc->texture_mutexes[0] || !gc->texture_mutexes[1]) {
-		warn("failed to create texture mutexes: %lu", GetLastError());
+		DWORD error = GetLastError();
+		if (error == 2) {
+			if (!gc->retrying) {
+				gc->retrying = 2;
+				info("hook not loaded yet, retrying..");
+			}
+		} else {
+			warn("failed to open texture mutexes: %lu",
+					GetLastError());
+		}
 		return false;
 	}
 
@@ -478,7 +675,7 @@ static inline bool init_texture_mutexes(struct game_capture *gc)
 /* if there's already a hook in the process, then signal and start */
 static inline bool attempt_existing_hook(struct game_capture *gc)
 {
-	gc->hook_restart = open_event_id(EVENT_CAPTURE_RESTART, gc->process_id);
+	gc->hook_restart = open_event_gc(gc, EVENT_CAPTURE_RESTART);
 	if (gc->hook_restart) {
 		debug("existing hook found, signaling process: %s",
 				gc->config.executable);
@@ -510,7 +707,7 @@ static inline void reset_frame_interval(struct game_capture *gc)
 
 static inline bool init_hook_info(struct game_capture *gc)
 {
-	gc->global_hook_info_map = get_hook_info(gc->process_id);
+	gc->global_hook_info_map = open_hook_info(gc);
 	if (!gc->global_hook_info_map) {
 		warn("init_hook_info: get_hook_info failed: %lu",
 				GetLastError());
@@ -531,8 +728,10 @@ static inline bool init_hook_info(struct game_capture *gc)
 	gc->global_hook_info->capture_overlay = gc->config.capture_overlays;
 	gc->global_hook_info->force_shmem = gc->config.force_shmem;
 	gc->global_hook_info->use_scale = gc->config.force_scaling;
-	gc->global_hook_info->cx = gc->config.scale_cx;
-	gc->global_hook_info->cy = gc->config.scale_cy;
+	if (gc->config.scale_cx)
+		gc->global_hook_info->cx = gc->config.scale_cx;
+	if (gc->config.scale_cy)
+		gc->global_hook_info->cy = gc->config.scale_cy;
 	reset_frame_interval(gc);
 
 	obs_enter_graphics();
@@ -625,7 +824,7 @@ static inline bool create_inject_process(struct game_capture *gc,
 	wchar_t *command_line_w = malloc(4096 * sizeof(wchar_t));
 	wchar_t *inject_path_w;
 	wchar_t *hook_dll_w;
-	bool anti_cheat = gc->config.anticheat_hook;
+	bool anti_cheat = use_anticheat(gc);
 	PROCESS_INFORMATION pi = {0};
 	STARTUPINFO si = {0};
 	bool success = false;
@@ -687,11 +886,11 @@ static inline bool inject_hook(struct game_capture *gc)
 	matching_architecture = !gc->process_is_64bit;
 #endif
 
-	if (matching_architecture && !gc->config.anticheat_hook) {
+	if (matching_architecture && !use_anticheat(gc)) {
 		info("using direct hook");
 		success = hook_direct(gc, hook_path);
 	} else {
-		info("using helper (%s hook)", gc->config.anticheat_hook ?
+		info("using helper (%s hook)", use_anticheat(gc) ?
 				"compatibility" : "direct");
 		success = create_inject_process(gc, inject_path, hook_dll);
 	}
@@ -702,29 +901,83 @@ cleanup:
 	return success;
 }
 
-static bool init_hook(struct game_capture *gc)
+static const char *blacklisted_exes[] = {
+	"explorer",
+	"steam",
+	"battle.net",
+	"galaxyclient",
+	"skype",
+	"uplay",
+	"origin",
+	"devenv",
+	"taskmgr",
+	"chrome",
+	"firefox",
+	"systemsettings",
+	"applicationframehost",
+	"cmd",
+	"shellexperiencehost",
+	"winstore.app",
+	"searchui",
+	NULL
+};
+
+static bool is_blacklisted_exe(const char *exe)
 {
-	if (gc->config.capture_any_fullscreen) {
-		struct dstr name = {0};
-		if (get_window_exe(&name, gc->next_window)) {
-			info("attempting to hook fullscreen process: %s",
-					name.array);
-			dstr_free(&name);
-		}
-	} else {
-		info("attempting to hook process: %s", gc->config.executable);
+	char cur_exe[MAX_PATH];
+
+	if (!exe)
+		return false;
+
+	for (const char **vals = blacklisted_exes; *vals; vals++) {
+		strcpy(cur_exe, *vals);
+		strcat(cur_exe, ".exe");
+
+		if (strcmpi(cur_exe, exe) == 0)
+			return true;
 	}
 
+	return false;
+}
+
+static bool target_suspended(struct game_capture *gc)
+{
+	return thread_is_suspended(gc->process_id, gc->thread_id);
+}
+
+static bool init_events(struct game_capture *gc);
+
+static bool init_hook(struct game_capture *gc)
+{
+	struct dstr exe = {0};
+	bool blacklisted_process = false;
+
+	if (gc->config.mode == CAPTURE_MODE_ANY) {
+		if (get_window_exe(&exe, gc->next_window)) {
+			info("attempting to hook fullscreen process: %s",
+					exe.array);
+		}
+	} else {
+		if (get_window_exe(&exe, gc->next_window)) {
+			info("attempting to hook process: %s", exe.array);
+		}
+	}
+
+	blacklisted_process = is_blacklisted_exe(exe.array);
+	if (blacklisted_process)
+		info("cannot capture %s due to being blacklisted", exe.array);
+	dstr_free(&exe);
+
+	if (blacklisted_process) {
+		return false;
+	}
+	if (target_suspended(gc)) {
+		return false;
+	}
 	if (!open_target_process(gc)) {
 		return false;
 	}
 	if (!init_keepalive(gc)) {
-		return false;
-	}
-	if (!init_texture_mutexes(gc)) {
-		return false;
-	}
-	if (!init_hook_info(gc)) {
 		return false;
 	}
 	if (!init_pipe(gc)) {
@@ -735,11 +988,61 @@ static bool init_hook(struct game_capture *gc)
 			return false;
 		}
 	}
+	if (!init_texture_mutexes(gc)) {
+		return false;
+	}
+	if (!init_hook_info(gc)) {
+		return false;
+	}
+	if (!init_events(gc)) {
+		return false;
+	}
+
+	SetEvent(gc->hook_init);
 
 	gc->window = gc->next_window;
 	gc->next_window = NULL;
 	gc->active = true;
+	gc->retrying = 0;
 	return true;
+}
+
+static void setup_window(struct game_capture *gc, HWND window)
+{
+	HANDLE hook_restart;
+	HANDLE process;
+
+	GetWindowThreadProcessId(window, &gc->process_id);
+	if (gc->process_id) {
+		process = open_process(PROCESS_QUERY_INFORMATION,
+			false, gc->process_id);
+		if (process) {
+			gc->is_app = is_app(process);
+			if (gc->is_app) {
+				gc->app_sid = get_app_sid(process);
+			}
+			CloseHandle(process);
+		}
+	}
+
+	/* do not wait if we're re-hooking a process */
+	hook_restart = open_event_gc(gc, EVENT_CAPTURE_RESTART);
+	if (hook_restart) {
+		gc->wait_for_target_startup = false;
+		CloseHandle(hook_restart);
+	}
+
+	/* otherwise if it's an unhooked process, always wait a bit for the
+	 * target process to start up before starting the hook process;
+	 * sometimes they have important modules to load first or other hooks
+	 * (such as steam) need a little bit of time to load.  ultimately this
+	 * helps prevent crashes */
+	if (gc->wait_for_target_startup) {
+		gc->retry_interval = 3.0f;
+		gc->wait_for_target_startup = false;
+	} else {
+		gc->next_window = window;
+	}
 }
 
 static void get_fullscreen_window(struct game_capture *gc)
@@ -779,18 +1082,7 @@ static void get_fullscreen_window(struct game_capture *gc)
 	    rect.right  == mi.rcMonitor.right  &&
 	    rect.bottom == mi.rcMonitor.bottom &&
 	    rect.top    == mi.rcMonitor.top) {
-
-		/* always wait a bit for the target process to start up before
-		 * starting the hook process; sometimes they have important
-		 * modules to load first or other hooks (such as steam) need a
-		 * little bit of time to load.  ultimately this helps prevent
-		 * crashes */
-		if (gc->wait_for_target_startup) {
-			gc->retry_interval = 3.0f;
-			gc->wait_for_target_startup = false;
-		} else {
-			gc->next_window = window;
-		}
+		setup_window(gc, window);
 	} else {
 		gc->wait_for_target_startup = true;
 	}
@@ -798,22 +1090,30 @@ static void get_fullscreen_window(struct game_capture *gc)
 
 static void get_selected_window(struct game_capture *gc)
 {
-	if (strcmpi(gc->config.class, "dwm") == 0) {
+	HWND window;
+
+	if (dstr_cmpi(&gc->class, "dwm") == 0) {
 		wchar_t class_w[512];
-		os_utf8_to_wcs(gc->config.class, 0, class_w, 512);
-		gc->next_window = FindWindowW(class_w, NULL);
+		os_utf8_to_wcs(gc->class.array, 0, class_w, 512);
+		window = FindWindowW(class_w, NULL);
 	} else {
-		gc->next_window = find_window(INCLUDE_MINIMIZED,
-				gc->config.priority,
-				gc->config.class,
-				gc->config.title,
-				gc->config.executable);
+		window = find_window(INCLUDE_MINIMIZED,
+				gc->priority,
+				gc->class.array,
+				gc->title.array,
+				gc->executable.array);
+	}
+
+	if (window) {
+		setup_window(gc, window);
+	} else {
+		gc->wait_for_target_startup = true;
 	}
 }
 
 static void try_hook(struct game_capture *gc)
 {
-	if (gc->config.capture_any_fullscreen) {
+	if (gc->config.mode == CAPTURE_MODE_ANY) {
 		get_fullscreen_window(gc);
 	} else {
 		get_selected_window(gc);
@@ -823,7 +1123,13 @@ static void try_hook(struct game_capture *gc)
 		gc->thread_id = GetWindowThreadProcessId(gc->next_window,
 				&gc->process_id);
 
-		if (!gc->thread_id || !gc->process_id) {
+		// Make sure we never try to hook ourselves (projector)
+		if (gc->process_id == GetCurrentProcessId())
+			return;
+
+		if (!gc->thread_id && gc->process_id)
+			return;
+		if (!gc->process_id) {
 			warn("error acquiring, failed to get window "
 					"thread/process ids: %lu",
 					GetLastError());
@@ -842,8 +1148,7 @@ static void try_hook(struct game_capture *gc)
 static inline bool init_events(struct game_capture *gc)
 {
 	if (!gc->hook_restart) {
-		gc->hook_restart = get_event_plus_id(EVENT_CAPTURE_RESTART,
-				gc->process_id);
+		gc->hook_restart = open_event_gc(gc, EVENT_CAPTURE_RESTART);
 		if (!gc->hook_restart) {
 			warn("init_events: failed to get hook_restart "
 			     "event: %lu", GetLastError());
@@ -852,8 +1157,7 @@ static inline bool init_events(struct game_capture *gc)
 	}
 
 	if (!gc->hook_stop) {
-		gc->hook_stop = get_event_plus_id(EVENT_CAPTURE_STOP,
-				gc->process_id);
+		gc->hook_stop = open_event_gc(gc, EVENT_CAPTURE_STOP);
 		if (!gc->hook_stop) {
 			warn("init_events: failed to get hook_stop event: %lu",
 					GetLastError());
@@ -861,9 +1165,17 @@ static inline bool init_events(struct game_capture *gc)
 		}
 	}
 
+	if (!gc->hook_init) {
+		gc->hook_init = open_event_gc(gc, EVENT_HOOK_INIT);
+		if (!gc->hook_init) {
+			warn("init_events: failed to get hook_init event: %lu",
+					GetLastError());
+			return false;
+		}
+	}
+
 	if (!gc->hook_ready) {
-		gc->hook_ready = get_event_plus_id(EVENT_HOOK_READY,
-				gc->process_id);
+		gc->hook_ready = open_event_gc(gc, EVENT_HOOK_READY);
 		if (!gc->hook_ready) {
 			warn("init_events: failed to get hook_ready event: %lu",
 					GetLastError());
@@ -872,8 +1184,7 @@ static inline bool init_events(struct game_capture *gc)
 	}
 
 	if (!gc->hook_exit) {
-		gc->hook_exit = get_event_plus_id(EVENT_HOOK_EXIT,
-				gc->process_id);
+		gc->hook_exit = open_event_gc(gc, EVENT_HOOK_EXIT);
 		if (!gc->hook_exit) {
 			warn("init_events: failed to get hook_exit event: %lu",
 					GetLastError());
@@ -892,9 +1203,6 @@ enum capture_result {
 
 static inline enum capture_result init_capture_data(struct game_capture *gc)
 {
-	char name[64];
-	sprintf(name, "%s%u", SHMEM_TEXTURE, gc->global_hook_info->map_id);
-
 	gc->cx = gc->global_hook_info->cx;
 	gc->cy = gc->global_hook_info->cy;
 	gc->pitch = gc->global_hook_info->pitch;
@@ -906,7 +1214,8 @@ static inline enum capture_result init_capture_data(struct game_capture *gc)
 
 	CloseHandle(gc->hook_data_map);
 
-	gc->hook_data_map = OpenFileMappingA(FILE_MAP_ALL_ACCESS, false, name);
+	gc->hook_data_map = open_map_plus_id(gc, SHMEM_TEXTURE,
+			gc->global_hook_info->map_id);
 	if (!gc->hook_data_map) {
 		DWORD error = GetLastError();
 		if (error == 2) {
@@ -1214,17 +1523,20 @@ static inline bool init_shtex_capture(struct game_capture *gc)
 
 static bool start_capture(struct game_capture *gc)
 {
-	if (!init_events(gc)) {
-		return false;
-	}
+	debug("Starting capture");
+
 	if (gc->global_hook_info->type == CAPTURE_TYPE_MEMORY) {
 		if (!init_shmem_capture(gc)) {
 			return false;
 		}
+
+		info("memory capture successful");
 	} else {
 		if (!init_shtex_capture(gc)) {
 			return false;
 		}
+
+		info("shared texture capture successful");
 	}
 
 	return true;
@@ -1241,14 +1553,52 @@ static inline bool capture_valid(struct game_capture *gc)
 static void game_capture_tick(void *data, float seconds)
 {
 	struct game_capture *gc = data;
+	bool deactivate = os_atomic_set_bool(&gc->deactivate_hook, false);
+	bool activate_now = os_atomic_set_bool(&gc->activate_hook_now, false);
+
+	if (activate_now) {
+		HWND hwnd = (HWND)os_atomic_load_long(&gc->hotkey_window);
+
+		if (is_uwp_window(hwnd))
+			hwnd = get_uwp_actual_window(hwnd);
+
+		if (get_window_exe(&gc->executable, hwnd)) {
+			get_window_title(&gc->title, hwnd);
+			get_window_class(&gc->class, hwnd);
+
+			gc->priority = WINDOW_PRIORITY_CLASS;
+			gc->retry_time = 10.0f;
+			gc->activate_hook = true;
+		} else {
+			deactivate = false;
+			activate_now = false;
+		}
+	} else if (deactivate) {
+		gc->activate_hook = false;
+	}
+
+	if (!obs_source_showing(gc->source)) {
+		if (gc->showing) {
+			if (gc->active)
+				stop_capture(gc);
+			gc->showing = false;
+		}
+		return;
+
+	} else if (!gc->showing) {
+		gc->retry_time = 10.0f;
+	}
 
 	if (gc->hook_stop && object_signalled(gc->hook_stop)) {
+		debug("hook stop signal received");
+		stop_capture(gc);
+	}
+	if (gc->active && deactivate) {
 		stop_capture(gc);
 	}
 
 	if (gc->active && !gc->hook_ready && gc->process_id) {
-		gc->hook_ready = get_event_plus_id(EVENT_HOOK_READY,
-				gc->process_id);
+		gc->hook_ready = open_event_gc(gc, EVENT_HOOK_READY);
 	}
 
 	if (gc->injector_process && object_signalled(gc->injector_process)) {
@@ -1268,10 +1618,13 @@ static void game_capture_tick(void *data, float seconds)
 	}
 
 	if (gc->hook_ready && object_signalled(gc->hook_ready)) {
+		debug("capture initializing!");
 		enum capture_result result = init_capture_data(gc);
 
 		if (result == CAPTURE_SUCCESS)
 			gc->capturing = start_capture(gc);
+		else
+			debug("init_capture_data failed");
 
 		if (result != CAPTURE_RETRY && !gc->capturing) {
 			gc->retry_interval = ERROR_RETRY_INTERVAL;
@@ -1282,14 +1635,9 @@ static void game_capture_tick(void *data, float seconds)
 	gc->retry_time += seconds;
 
 	if (!gc->active) {
-		if (!obs_source_showing(gc->source)) {
-			gc->retry_time = 0.0f;
-			return;
-		}
-
 		if (!gc->error_acquiring &&
 		    gc->retry_time > gc->retry_interval) {
-			if (gc->config.capture_any_fullscreen ||
+			if (gc->config.mode == CAPTURE_MODE_ANY ||
 			    gc->activate_hook) {
 				try_hook(gc);
 				gc->retry_time = 0.0f;
@@ -1320,18 +1668,25 @@ static void game_capture_tick(void *data, float seconds)
 			}
 		}
 	}
+
+	if (!gc->showing)
+		gc->showing = true;
 }
 
 static inline void game_capture_render_cursor(struct game_capture *gc)
 {
 	POINT p = {0};
+	HWND window;
 
-	if (!gc->global_hook_info->window ||
-	    !gc->global_hook_info->base_cx ||
+	if (!gc->global_hook_info->base_cx ||
 	    !gc->global_hook_info->base_cy)
 		return;
 
-	ClientToScreen((HWND)(uintptr_t)gc->global_hook_info->window, &p);
+	window = !!gc->global_hook_info->window
+		? (HWND)(uintptr_t)gc->global_hook_info->window
+		: gc->window;
+
+	ClientToScreen(window, &p);
 
 	float x_scale = (float)gc->global_hook_info->cx /
 		(float)gc->global_hook_info->base_cx;
@@ -1346,11 +1701,11 @@ static inline void game_capture_render_cursor(struct game_capture *gc)
 static void game_capture_render(void *data, gs_effect_t *effect)
 {
 	struct game_capture *gc = data;
-	if (!gc->texture)
+	if (!gc->texture || !gc->active)
 		return;
 
-	effect = gc->config.allow_transparency ?
-		obs_get_default_effect() : obs_get_opaque_effect();
+	effect = obs_get_base_effect(gc->config.allow_transparency ?
+			OBS_EFFECT_DEFAULT : OBS_EFFECT_OPAQUE);
 
 	while (gs_effect_loop(effect, "Draw")) {
 		obs_source_draw(gc->texture, 0, 0, 0, 0,
@@ -1362,7 +1717,7 @@ static void game_capture_render(void *data, gs_effect_t *effect)
 	}
 
 	if (!gc->config.allow_transparency && gc->config.cursor) {
-		effect = obs_get_default_effect();
+		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
 		while (gs_effect_loop(effect, "Draw")) {
 			game_capture_render_cursor(gc);
@@ -1390,7 +1745,7 @@ static const char *game_capture_name(void *unused)
 
 static void game_capture_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_bool(settings, SETTING_ANY_FULLSCREEN, true);
+	obs_data_set_default_string(settings, SETTING_MODE, SETTING_MODE_ANY);
 	obs_data_set_default_int(settings, SETTING_WINDOW_PRIORITY,
 			(int)WINDOW_PRIORITY_EXE);
 	obs_data_set_default_bool(settings, SETTING_COMPATIBILITY, false);
@@ -1400,20 +1755,27 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, SETTING_SCALE_RES, "0x0");
 	obs_data_set_default_bool(settings, SETTING_LIMIT_FRAMERATE, false);
 	obs_data_set_default_bool(settings, SETTING_CAPTURE_OVERLAYS, false);
-	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, false);
+	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, true);
 }
 
-static bool any_fullscreen_callback(obs_properties_t *ppts,
+static bool mode_callback(obs_properties_t *ppts,
 		obs_property_t *p, obs_data_t *settings)
 {
-	bool any_fullscreen = obs_data_get_bool(settings,
-			SETTING_ANY_FULLSCREEN);
+	bool capture_window;
+
+	if (using_older_non_mode_format(settings)) {
+		capture_window = !obs_data_get_bool(settings,
+				SETTING_ANY_FULLSCREEN);
+	} else {
+		const char *mode = obs_data_get_string(settings, SETTING_MODE);
+		capture_window = strcmp(mode, SETTING_MODE_WINDOW) == 0;
+	}
 
 	p = obs_properties_get(ppts, SETTING_CAPTURE_WINDOW);
-	obs_property_set_enabled(p, !any_fullscreen);
+	obs_property_set_visible(p, capture_window);
 
 	p = obs_properties_get(ppts, SETTING_WINDOW_PRIORITY);
-	obs_property_set_enabled(p, !any_fullscreen);
+	obs_property_set_visible(p, capture_window);
 
 	return true;
 }
@@ -1500,6 +1862,15 @@ static BOOL CALLBACK EnumFirstMonitor(HMONITOR monitor, HDC hdc,
 	return false;
 }
 
+static bool window_not_blacklisted(const char *title, const char *class,
+		const char *exe)
+{
+	UNUSED_PARAMETER(title);
+	UNUSED_PARAMETER(class);
+
+	return !is_blacklisted_exe(exe);
+}
+
 static obs_properties_t *game_capture_properties(void *data)
 {
 	HMONITOR monitor;
@@ -1520,18 +1891,37 @@ static obs_properties_t *game_capture_properties(void *data)
 		}
 	}
 
+	/* update from deprecated settings */
+	if (data) {
+		struct game_capture *gc = data;
+		obs_data_t *settings = obs_source_get_settings(gc->source);
+		if (using_older_non_mode_format(settings)) {
+			bool any = obs_data_get_bool(settings,
+					SETTING_ANY_FULLSCREEN);
+			const char *mode = any ?
+				SETTING_MODE_ANY : SETTING_MODE_WINDOW;
+
+			obs_data_set_string(settings, SETTING_MODE, mode);
+		}
+		obs_data_release(settings);
+	}
+
 	obs_properties_t *ppts = obs_properties_create();
 	obs_property_t *p;
 
-	p = obs_properties_add_bool(ppts, SETTING_ANY_FULLSCREEN,
-			TEXT_ANY_FULLSCREEN);
+	p = obs_properties_add_list(ppts, SETTING_MODE, TEXT_MODE,
+			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
-	obs_property_set_modified_callback(p, any_fullscreen_callback);
+	obs_property_list_add_string(p, TEXT_MODE_ANY,    SETTING_MODE_ANY);
+	obs_property_list_add_string(p, TEXT_MODE_WINDOW, SETTING_MODE_WINDOW);
+	obs_property_list_add_string(p, TEXT_MODE_HOTKEY, SETTING_MODE_HOTKEY);
+
+	obs_property_set_modified_callback(p, mode_callback);
 
 	p = obs_properties_add_list(ppts, SETTING_CAPTURE_WINDOW, TEXT_WINDOW,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, "", "");
-	fill_window_list(p, INCLUDE_MINIMIZED);
+	fill_window_list(p, INCLUDE_MINIMIZED, window_not_blacklisted);
 
 	obs_property_set_modified_callback(p, window_changed_callback);
 
@@ -1589,7 +1979,8 @@ static obs_properties_t *game_capture_properties(void *data)
 struct obs_source_info game_capture_info = {
 	.id = "game_capture",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW |
+	                OBS_SOURCE_DO_NOT_DUPLICATE,
 	.get_name = game_capture_name,
 	.create = game_capture_create,
 	.destroy = game_capture_destroy,

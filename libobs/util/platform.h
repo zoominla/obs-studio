@@ -34,6 +34,12 @@ EXPORT FILE *os_wfopen(const wchar_t *path, const char *mode);
 EXPORT FILE *os_fopen(const char *path, const char *mode);
 EXPORT int64_t os_fgetsize(FILE *file);
 
+#ifdef _WIN32
+EXPORT int os_stat(const char *file, struct stat *st);
+#else
+#define os_stat stat
+#endif
+
 EXPORT int os_fseeki64(FILE *file, int64_t offset, int origin);
 EXPORT int64_t os_ftelli64(FILE *file);
 
@@ -50,6 +56,9 @@ EXPORT bool os_quick_write_utf8_file_safe(const char *path, const char *str,
 EXPORT char *os_quick_read_mbs_file(const char *path);
 EXPORT bool os_quick_write_mbs_file(const char *path, const char *str,
 		size_t len);
+
+EXPORT int64_t os_get_file_size(const char *path);
+EXPORT int64_t os_get_free_space(const char *path);
 
 EXPORT size_t os_mbs_to_wcs(const char *str, size_t str_len, wchar_t *dst,
 		size_t dst_size);
@@ -99,7 +108,15 @@ EXPORT uint64_t os_gettime_ns(void);
 EXPORT int os_get_config_path(char *dst, size_t size, const char *name);
 EXPORT char *os_get_config_path_ptr(const char *name);
 
+EXPORT int os_get_program_data_path(char *dst, size_t size, const char *name);
+EXPORT char *os_get_program_data_path_ptr(const char *name);
+
 EXPORT bool os_file_exists(const char *path);
+
+EXPORT size_t os_get_abs_path(const char *path, char *abspath, size_t size);
+EXPORT char *os_get_abs_path_ptr(const char *path);
+
+EXPORT const char *os_get_path_extension(const char *path);
 
 struct os_dir;
 typedef struct os_dir os_dir_t;
@@ -145,12 +162,17 @@ EXPORT int os_mkdirs(const char *path);
 EXPORT int os_rename(const char *old_path, const char *new_path);
 EXPORT int os_copyfile(const char *file_in, const char *file_out);
 
+EXPORT char *os_generate_formatted_filename(const char *extension, bool space,
+		const char *format);
+
 struct os_inhibit_info;
 typedef struct os_inhibit_info os_inhibit_t;
 
 EXPORT os_inhibit_t *os_inhibit_sleep_create(const char *reason);
 EXPORT bool os_inhibit_sleep_set_active(os_inhibit_t *info, bool active);
 EXPORT void os_inhibit_sleep_destroy(os_inhibit_t *info);
+
+EXPORT void os_breakpoint(void);
 
 #ifdef _MSC_VER
 #define strtoll _strtoi64

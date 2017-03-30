@@ -34,7 +34,11 @@ uint32_t texbuf_w = 2048, texbuf_h = 2048;
 static struct obs_source_info freetype2_source_info = {
 	.id = "text_ft2_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO,
+	.output_flags = OBS_SOURCE_VIDEO |
+#ifdef _WIN32
+	                OBS_SOURCE_DEPRECATED |
+#endif
+	                OBS_SOURCE_CUSTOM_DRAW,
 	.get_name = ft2_source_get_name,
 	.create = ft2_source_create,
 	.destroy = ft2_source_destroy,
@@ -46,6 +50,26 @@ static struct obs_source_info freetype2_source_info = {
 	.get_properties = ft2_source_properties,
 };
 
+static bool plugin_initialized = false;
+
+static void init_plugin(void)
+{
+	if (plugin_initialized)
+		return;
+
+	FT_Init_FreeType(&ft2_lib);
+
+	if (ft2_lib == NULL) {
+		blog(LOG_WARNING, "FT2-text: Failed to initialize FT2.");
+		return;
+	}
+
+	if (!load_cached_os_font_list())
+		load_os_font_list();
+
+	plugin_initialized = true;
+}
+
 bool obs_module_load()
 {
 	char *config_dir = obs_module_config_path(NULL);
@@ -54,16 +78,6 @@ bool obs_module_load()
 		bfree(config_dir);
 	}
 
-	FT_Init_FreeType(&ft2_lib);
-
-	if (ft2_lib == NULL) {
-		blog(LOG_WARNING, "FT2-text: Failed to initialize FT2.");
-		return false;
-	}
-
-	if (!load_cached_os_font_list())
-		load_os_font_list();
-
 	obs_register_source(&freetype2_source_info);
 
 	return true;
@@ -71,8 +85,10 @@ bool obs_module_load()
 
 void obs_module_unload(void)
 {
-	free_os_font_list();
-	FT_Done_FreeType(ft2_lib);
+	if (plugin_initialized) {
+		free_os_font_list();
+		FT_Done_FreeType(ft2_lib);
+	}
 }
 
 static const char *ft2_source_get_name(void *unused)
@@ -200,6 +216,7 @@ static void ft2_source_render(void *data, gs_effect_t *effect)
 	if (srcdata == NULL) return;
 
 	if (srcdata->tex == NULL || srcdata->vbuf == NULL) return;
+	if (srcdata->text == NULL || *srcdata->text == 0) return;
 
 	gs_reset_blend_state();
 	if (srcdata->outline_text) draw_outlines(srcdata);
@@ -366,7 +383,7 @@ static void ft2_source_update(void *data, obs_data_t *settings)
 		bfree(srcdata->texbuf);
 		srcdata->texbuf = NULL;
 	}
-	srcdata->texbuf = bzalloc(texbuf_w * texbuf_h * 4);
+	srcdata->texbuf = bzalloc(texbuf_w * texbuf_h);
 
 	if (srcdata->font_face)
 		cache_standard_glyphs(srcdata);
@@ -437,6 +454,8 @@ static void *ft2_source_create(obs_data_t *settings, obs_source_t *source)
 	obs_data_t *font_obj = obs_data_create();
 	srcdata->src = source;
 
+	init_plugin();
+
 	srcdata->font_size = 32;
 
 	obs_data_set_default_string(font_obj, "face", DEFAULT_FACE);
@@ -445,8 +464,6 @@ static void *ft2_source_create(obs_data_t *settings, obs_source_t *source)
 
 	obs_data_set_default_int(settings, "color1", 0xFFFFFFFF);
 	obs_data_set_default_int(settings, "color2", 0xFFFFFFFF);
-	obs_data_set_default_string(settings, "text",
-		"The lazy snake jumps over the happy MASKEN.");
 
 	ft2_source_update(srcdata, settings);
 

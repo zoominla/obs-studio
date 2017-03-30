@@ -418,7 +418,7 @@ static inline bool init_obs_graphics_objects(syphon_t s)
 	s->vertbuffer = create_vertbuffer();
 	obs_leave_graphics();
 
-	s->effect     = obs_get_default_rect_effect();
+	s->effect = obs_get_base_effect(OBS_EFFECT_DEFAULT_RECT);
 
 	return s->sampler != NULL && s->vertbuffer != NULL && s->effect != NULL;
 }
@@ -1275,7 +1275,8 @@ static void syphon_update(void *data, obs_data_t *settings)
 struct obs_source_info syphon_info = {
 	.id             = "syphon-input",
 	.type           = OBS_SOURCE_TYPE_INPUT,
-	.output_flags   = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
+	.output_flags   = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW |
+	                  OBS_SOURCE_DO_NOT_DUPLICATE,
 	.get_name       = syphon_get_name,
 	.create         = syphon_create,
 	.destroy        = syphon_destroy,

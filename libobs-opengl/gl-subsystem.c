@@ -221,6 +221,14 @@ int device_create(gs_device_t **p_device, uint32_t adapter)
 	device_leave_context(device);
 	device->cur_swap = NULL;
 
+#ifdef _WIN32
+	blog(LOG_INFO, "Warning: The OpenGL renderer is currently in use.  "
+			"On windows, the OpenGL renderer can decrease "
+			"capture performance due to the lack of specific "
+			"features used to maximize capture performance.  "
+			"The Direct3D 11 renderer is recommended instead.");
+#endif
+
 	*p_device = device;
 	return GS_SUCCESS;
 
@@ -447,7 +455,7 @@ void device_load_texture(gs_device_t *device, gs_texture_t *tex, int unit)
 
 	/* need a pixel shader to properly bind textures */
 	if (!device->cur_pixel_shader)
-		tex = NULL;
+		goto fail;
 
 	if (cur_tex == tex)
 		return;
@@ -470,7 +478,11 @@ void device_load_texture(gs_device_t *device, gs_texture_t *tex, int unit)
 	if (!tex)
 		return;
 
-	sampler = device->cur_samplers[param->sampler_id];
+	// texelFetch doesn't need a sampler
+	if (param->sampler_id != (size_t)-1)
+		sampler = device->cur_samplers[param->sampler_id];
+	else
+		sampler = NULL;
 
 	if (!gl_bind_texture(tex->gl_target, tex->texture))
 		goto fail;
@@ -975,7 +987,7 @@ void device_draw(gs_device_t *device, enum gs_draw_mode draw_mode,
 	if (!program)
 		goto fail;
 
-	load_vb_buffers(program, device->cur_vertex_buffer);
+	load_vb_buffers(program, device->cur_vertex_buffer, ib);
 
 	if (program != device->cur_program && device->cur_program) {
 		glUseProgram(0);
@@ -1359,7 +1371,7 @@ uint32_t gs_voltexture_get_height(const gs_texture_t *voltex)
 	return 0;
 }
 
-uint32_t gs_voltexture_getdepth(const gs_texture_t *voltex)
+uint32_t gs_voltexture_get_depth(const gs_texture_t *voltex)
 {
 	/* TODO */
 	UNUSED_PARAMETER(voltex);

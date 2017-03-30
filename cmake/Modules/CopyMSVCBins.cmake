@@ -8,7 +8,7 @@ if(COPIED_DEPENDENCIES)
 	return()
 endif()
 
-option(COPY_DEPENDENCIES "Automaticaly try copying all dependencies" OFF)
+option(COPY_DEPENDENCIES "Automaticaly try copying all dependencies" ON)
 if(NOT COPY_DEPENDENCIES)
 	return()
 endif()
@@ -18,11 +18,6 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8)
 else()
 	set(_bin_suffix 32)
 endif()
-
-find_package(Libavcodec QUIET)
-find_package(Libx264 QUIET)
-find_package(Libfdk QUIET)
-find_package(Qt5Core QUIET)
 
 file(GLOB FFMPEG_BIN_FILES
 	"${FFMPEG_avcodec_INCLUDE_DIR}/../bin/avcodec-*.dll"
@@ -67,6 +62,9 @@ file(GLOB FFMPEG_BIN_FILES
 	"${FFMPEG_avcodec_INCLUDE_DIR}/bin/libogg*.dll"
 	"${FFMPEG_avcodec_INCLUDE_DIR}/bin/libvorbis*.dll"
 
+	"${FFMPEG_avcodec_INCLUDE_DIR}/../bin/libvpx*.dll"
+	"${FFMPEG_avcodec_INCLUDE_DIR}/bin/libvpx*.dll"
+
 	"${FFMPEG_avcodec_INCLUDE_DIR}/../bin${_bin_suffix}/libopus*.dll"
 	"${FFMPEG_avcodec_INCLUDE_DIR}/../bin${_bin_suffix}/opus*.dll"
 	"${FFMPEG_avcodec_INCLUDE_DIR}/bin${_bin_suffix}/libopus*.dll"
@@ -101,6 +99,16 @@ file(GLOB LIBFDK_BIN_FILES
 	"${Libfdk_INCLUDE_DIR}/../bin/libfdk*-*.dll"
 	"${Libfdk_INCLUDE_DIR}/bin/libfdk*-*.dll"
 	"${Libfdk_INCLUDE_DIR}/bin${_bin_suffix}/libfdk*-*.dll")
+
+file(GLOB SSL_BIN_FILES
+	"${SSL_INCLUDE_DIR}/../bin${_bin_suffix}/ssleay32*.dll"
+	"${SSL_INCLUDE_DIR}/../bin${_bin_suffix}/libeay32*.dll"
+	"${SSL_INCLUDE_DIR}/../bin/ssleay32*.dll"
+	"${SSL_INCLUDE_DIR}/../bin/libeay32*.dll"
+	"${SSL_INCLUDE_DIR}/bin${_bin_suffix}/ssleay32*.dll"
+	"${SSL_INCLUDE_DIR}/bin${_bin_suffix}/libeay32*.dll"
+	"${SSL_INCLUDE_DIR}/bin/ssleay32*.dll"
+	"${SSL_INCLUDE_DIR}/bin/libeay32*.dll")
 
 file(GLOB CURL_BIN_FILES
 	"${CURL_INCLUDE_DIR}/../build/Win${_bin_suffix}/VC12/DLL Release - DLL Windows SSPI/libcurl.dll"
@@ -158,6 +166,7 @@ set(ALL_BASE_BIN_FILES
 	${FFMPEG_BIN_FILES}
 	${X264_BIN_FILES}
 	${CURL_BIN_FILES}
+	${SSL_BIN_FILES}
 	${ZLIB_BIN_FILES}
 	${LIBFDK_BIN_FILES}
 	${FREETYPE_BIN_FILES}
@@ -190,6 +199,7 @@ message(STATUS "x264 files: ${X264_BIN_FILES}")
 message(STATUS "Libfdk files: ${LIBFDK_BIN_FILES}")
 message(STATUS "Freetype files: ${FREETYPE_BIN_FILES}")
 message(STATUS "curl files: ${CURL_BIN_FILES}")
+message(STATUS "ssl files: ${SSL_BIN_FILES}")
 message(STATUS "zlib files: ${ZLIB_BIN_FILES}")
 message(STATUS "QT Debug files: ${QT_DEBUG_BIN_FILES}")
 message(STATUS "QT Debug Platform files: ${QT_DEBUG_PLAT_BIN_FILES}")

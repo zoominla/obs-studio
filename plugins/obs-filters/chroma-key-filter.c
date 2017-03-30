@@ -150,7 +150,7 @@ static void *chroma_key_create(obs_data_t *settings, obs_source_t *context)
 	obs_enter_graphics();
 
 	filter->effect = gs_effect_create_from_file(effect_path, NULL);
-	if (filter) {
+	if (filter->effect) {
 		filter->color_param = gs_effect_get_param_by_name(
 				filter->effect, "color");
 		filter->contrast_param = gs_effect_get_param_by_name(
@@ -194,8 +194,9 @@ static void chroma_key_render(void *data, gs_effect_t *effect)
 	uint32_t height = obs_source_get_base_height(target);
 	struct vec2 pixel_size;
 
-	obs_source_process_filter_begin(filter->context, GS_RGBA,
-			OBS_ALLOW_DIRECT_RENDERING);
+	if (!obs_source_process_filter_begin(filter->context, GS_RGBA,
+				OBS_ALLOW_DIRECT_RENDERING))
+		return;
 
 	vec2_set(&pixel_size, 1.0f / (float)width, 1.0f / (float)height);
 

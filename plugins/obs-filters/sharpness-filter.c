@@ -52,7 +52,7 @@ static void *sharpness_create(obs_data_t *settings, obs_source_t *context)
 	obs_enter_graphics();
 
 	filter->effect = gs_effect_create_from_file(effect_path, NULL);
-	if (filter) {
+	if (filter->effect) {
 		filter->sharpness_param = gs_effect_get_param_by_name(
 			filter->effect, "sharpness");
 		filter->texture_width = gs_effect_get_param_by_name(
@@ -77,11 +77,10 @@ static void *sharpness_create(obs_data_t *settings, obs_source_t *context)
 static void sharpness_render(void *data, gs_effect_t *effect)
 {
 	struct sharpness_data *filter = data;
-	if (!filter) return;
-	if (!obs_filter_get_target(filter->context)) return;
 
-	obs_source_process_filter_begin(filter->context, GS_RGBA,
-		OBS_ALLOW_DIRECT_RENDERING);
+	if (!obs_source_process_filter_begin(filter->context, GS_RGBA,
+				OBS_ALLOW_DIRECT_RENDERING))
+		return;
 
 	filter->texwidth =(float)obs_source_get_width(
 			obs_filter_get_target(filter->context));

@@ -1,5 +1,3 @@
-#define _CRT_SECURE_NO_WARNINGS
-
 #ifdef _MSC_VER
 #pragma warning(disable : 4214) /* nonstandard extension, non-int bitfield */
 #pragma warning(disable : 4054) /* function pointer to data pointer */
@@ -26,6 +24,8 @@ static struct func_hook swap_buffers;
 static struct func_hook wgl_swap_layer_buffers;
 static struct func_hook wgl_swap_buffers;
 static struct func_hook wgl_delete_context;
+
+static bool darkest_dungeon_fix = false;
 
 struct gl_data {
 	HDC                            hdc;
@@ -231,9 +231,14 @@ static void get_window_size(HDC hdc, uint32_t *cx, uint32_t *cy)
 	HWND hwnd = WindowFromDC(hdc);
         RECT rc = {0};
 
-        GetClientRect(hwnd, &rc);
-	*cx = rc.right;
-	*cy = rc.bottom;
+	if (darkest_dungeon_fix) {
+		*cx = 1920;
+		*cy = 1080;
+	} else {
+		GetClientRect(hwnd, &rc);
+		*cx = rc.right;
+		*cy = rc.bottom;
+	}
 }
 
 static inline bool gl_shtex_init_window(void)
@@ -532,10 +537,15 @@ static int gl_init(HDC hdc)
 	bool success = false;
 	RECT rc = {0};
 
-	GetClientRect(window, &rc);
+	if (darkest_dungeon_fix) {
+		data.base_cx = 1920;
+		data.base_cy = 1080;
+	} else {
+		GetClientRect(window, &rc);
+		data.base_cx = rc.right;
+		data.base_cy = rc.bottom;
+	}
 
-	data.base_cx = rc.right;
-	data.base_cy = rc.bottom;
 	data.hdc = hdc;
 	data.format = DXGI_FORMAT_B8G8R8A8_UNORM;
 	data.using_scale = global_hook_info->use_scale;
@@ -586,9 +596,11 @@ static void gl_copy_backbuffer(GLuint dst)
 	}
 
 	glReadBuffer(GL_BACK);
-	if (gl_error("gl_copy_backbuffer", "failed to set read buffer")) {
-		return;
-	}
+
+	/* darkest dungeon fix */
+	darkest_dungeon_fix =
+		glGetError() == GL_INVALID_OPERATION &&
+		_strcmpi(process_name, "Darkest.exe") == 0;
 
 	glDrawBuffer(GL_COLOR_ATTACHMENT0);
 	if (gl_error("gl_copy_backbuffer", "failed to set draw buffer")) {
@@ -727,6 +739,9 @@ static void gl_capture(HDC hdc)
 			return;
 		}
 	}
+
+	/* reset error flag */
+	glGetError();
 
 	if (capture_should_stop()) {
 		gl_free();

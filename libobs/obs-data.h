@@ -18,6 +18,7 @@
 #pragma once
 
 #include "util/c99defs.h"
+#include "media-io/frame-rate.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -194,6 +195,7 @@ EXPORT void obs_data_item_remove(obs_data_item_t **item);
 /* Gets Item type */
 EXPORT enum obs_data_type obs_data_item_gettype(obs_data_item_t *item);
 EXPORT enum obs_data_number_type obs_data_item_numtype(obs_data_item_t *item);
+EXPORT const char *obs_data_item_get_name(obs_data_item_t *item);
 
 /* Item set functions */
 EXPORT void obs_data_item_set_string(obs_data_item_t **item, const char *val);
@@ -304,6 +306,48 @@ EXPORT void obs_data_get_autoselect_vec4(obs_data_t *data, const char *name,
 		struct vec4 *val);
 EXPORT void obs_data_get_autoselect_quat(obs_data_t *data, const char *name,
 		struct quat *val);
+
+/* ------------------------------------------------------------------------- */
+/* Helper functions for media_frames_per_second/OBS_PROPERTY_FRAME_RATE */
+EXPORT void obs_data_set_frames_per_second(obs_data_t *data,
+		const char *name,
+		struct media_frames_per_second fps, const char *option);
+EXPORT void obs_data_set_default_frames_per_second(obs_data_t *data,
+		const char *name,
+		struct media_frames_per_second fps, const char *option);
+EXPORT void obs_data_set_autoselect_frames_per_second(obs_data_t *data,
+		const char *name,
+		struct media_frames_per_second fps, const char *option);
+
+EXPORT bool obs_data_get_frames_per_second(obs_data_t *data,
+		const char *name,
+		struct media_frames_per_second *fps, const char **option);
+EXPORT bool obs_data_get_default_frames_per_second(obs_data_t *data,
+		const char *name,
+		struct media_frames_per_second *fps, const char **option);
+EXPORT bool obs_data_get_autoselect_frames_per_second(obs_data_t *data,
+		const char *name,
+		struct media_frames_per_second *fps, const char **option);
+
+EXPORT void obs_data_item_set_frames_per_second(
+		obs_data_item_t **item,
+		struct media_frames_per_second fps, const char *option);
+EXPORT void obs_data_item_set_default_frames_per_second(
+		obs_data_item_t **item,
+		struct media_frames_per_second fps, const char *option);
+EXPORT void obs_data_item_set_autoselect_frames_per_second(
+		obs_data_item_t **item,
+		struct media_frames_per_second fps, const char *option);
+
+EXPORT bool obs_data_item_get_frames_per_second(
+		obs_data_item_t *item,
+		struct media_frames_per_second *fps, const char **option);
+EXPORT bool obs_data_item_get_default_frames_per_second(
+		obs_data_item_t *item,
+		struct media_frames_per_second *fps, const char **option);
+EXPORT bool obs_data_item_get_autoselect_frames_per_second(
+		obs_data_item_t *item,
+		struct media_frames_per_second *fps, const char **option);
 
 /* ------------------------------------------------------------------------- */
 /* OBS-specific functions */

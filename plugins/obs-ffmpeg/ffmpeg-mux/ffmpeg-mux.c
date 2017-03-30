@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <windows.h>
 #define inline __inline
 
 #endif
@@ -73,6 +74,7 @@ struct main_params {
 	int fps_num;
 	int fps_den;
 	char *acodec;
+	char *muxer_settings;
 };
 
 struct audio_params {
@@ -247,6 +249,9 @@ static bool init_params(int *argc, char ***argv, struct main_params *params,
 	}
 
 	*p_audio = audio;
+
+	get_opt_str(argc, argv, &params->muxer_settings, "muxer settings");
+
 	return true;
 }
 
@@ -350,7 +355,8 @@ static void create_audio_stream(struct ffmpeg_mux *ffm, int idx)
 
 static bool init_streams(struct ffmpeg_mux *ffm)
 {
-	create_video_stream(ffm);
+	if (ffm->params.has_video)
+		create_video_stream(ffm);
 
 	if (ffm->params.tracks) {
 		ffm->audio_streams =
@@ -438,6 +444,10 @@ static inline bool ffmpeg_mux_get_extra_data(struct ffmpeg_mux *ffm)
 	return true;
 }
 
+#ifdef _MSC_VER
+#pragma warning(disable : 4996)
+#endif
+
 static inline int open_output_file(struct ffmpeg_mux *ffm)
 {
 	AVOutputFormat *format = ffm->output->oformat;
@@ -453,12 +463,41 @@ static inline int open_output_file(struct ffmpeg_mux *ffm)
 		}
 	}
 
-	ret = avformat_write_header(ffm->output, NULL);
+	strncpy(ffm->output->filename, ffm->params.file,
+			sizeof(ffm->output->filename));
+	ffm->output->filename[sizeof(ffm->output->filename) - 1] = 0;
+
+	AVDictionary *dict = NULL;
+	if ((ret = av_dict_parse_string(&dict, ffm->params.muxer_settings,
+				"=", " ", 0))) {
+		printf("Failed to parse muxer settings: %s\n%s",
+				av_err2str(ret), ffm->params.muxer_settings);
+
+		av_dict_free(&dict);
+	}
+
+	if (av_dict_count(dict) > 0) {
+		printf("Using muxer settings:");
+
+		AVDictionaryEntry *entry = NULL;
+		while ((entry = av_dict_get(dict, "", entry,
+						AV_DICT_IGNORE_SUFFIX)))
+			printf("\n\t%s=%s", entry->key, entry->value);
+
+		printf("\n");
+	}
+
+	ret = avformat_write_header(ffm->output, &dict);
 	if (ret < 0) {
 		printf("Error opening '%s': %s",
 				ffm->params.file, av_err2str(ret));
+
+		av_dict_free(&dict);
+
 		return ret == -22 ? FFM_UNSUPPORTED : FFM_ERROR;
 	}
+
+	av_dict_free(&dict);
 
 	return FFM_SUCCESS;
 }
@@ -592,7 +631,11 @@ static inline bool ffmpeg_mux_packet(struct ffmpeg_mux *ffm, uint8_t *buf,
 
 /* ------------------------------------------------------------------------- */
 
+#ifdef _WIN32
+int wmain(int argc, wchar_t *argv_w[])
+#else
 int main(int argc, char *argv[])
+#endif
 {
 	struct ffm_packet_info info = {0};
 	struct ffmpeg_mux ffm = {0};
@@ -601,6 +644,21 @@ int main(int argc, char *argv[])
 	int ret;
 
 #ifdef _WIN32
+	char **argv;
+
+	argv = malloc(argc * sizeof(char*));
+	for (int i = 0; i < argc; i++) {
+		size_t len = wcslen(argv_w[i]);
+		int size;
+
+		size = WideCharToMultiByte(CP_UTF8, 0, argv_w[i], (int)len,
+				NULL, 0, NULL, NULL);
+		argv[i] = malloc(size + 1);
+		WideCharToMultiByte(CP_UTF8, 0, argv_w[i], (int)len, argv[i],
+				size + 1, NULL, NULL);
+		argv[i][size] = 0;
+	}
+
 	_setmode(_fileno(stdin), O_BINARY);
 #endif
 	setvbuf(stderr, NULL, _IONBF, 0);
@@ -623,5 +681,11 @@ int main(int argc, char *argv[])
 
 	ffmpeg_mux_free(&ffm);
 	resize_buf_free(&rb);
+
+#ifdef _WIN32
+	for (int i = 0; i < argc; i++)
+		free(argv[i]);
+	free(argv);
+#endif
 	return 0;
 }

@@ -21,39 +21,9 @@
 #include "media-io/format-conversion.h"
 #include "media-io/video-frame.h"
 
-static inline void calculate_base_volume(struct obs_core_data *data,
-		struct obs_view *view, obs_source_t *target)
-{
-	if (!target->activate_refs) {
-		target->base_volume = 0.0f;
-
-	/* only walk the tree if there are transitions active */
-	} else if (data->active_transitions) {
-		float best_vol = 0.0f;
-
-		for (size_t i = 0; i < MAX_CHANNELS; i++) {
-			struct obs_source *source = view->channels[i];
-			float vol = 0.0f;
-
-			if (!source)
-				continue;
-
-			vol = obs_source_get_target_volume(source, target);
-			if (best_vol < vol)
-				best_vol = vol;
-		}
-
-		target->base_volume = best_vol;
-
-	} else {
-		target->base_volume = 1.0f;
-	}
-}
-
 static uint64_t tick_sources(uint64_t cur_time, uint64_t last_time)
 {
 	struct obs_core_data *data = &obs->data;
-	struct obs_view      *view = &data->main_view;
 	struct obs_source    *source;
 	uint64_t             delta_time;
 	float                seconds;
@@ -73,17 +43,6 @@ static uint64_t tick_sources(uint64_t cur_time, uint64_t last_time)
 		obs_source_video_tick(source, seconds);
 		source = (struct obs_source*)source->context.next;
 	}
-
-	/* calculate source volumes */
-	pthread_mutex_lock(&view->channels_mutex);
-
-	source = data->first_source;
-	while (source) {
-		calculate_base_volume(data, view, source);
-		source = (struct obs_source*)source->context.next;
-	}
-
-	pthread_mutex_unlock(&view->channels_mutex);
 
 	pthread_mutex_unlock(&data->sources_mutex);
 
@@ -167,7 +126,8 @@ static inline gs_effect_t *get_scale_effect_internal(
 	switch (video->scale_type) {
 	case OBS_SCALE_BILINEAR: return video->default_effect;
 	case OBS_SCALE_LANCZOS:  return video->lanczos_effect;
-	case OBS_SCALE_BICUBIC:;
+	case OBS_SCALE_BICUBIC:
+	default:;
 	}
 
 	return video->bicubic_effect;
@@ -547,6 +507,9 @@ static inline void video_sleep(struct obs_core_video *video,
 		*p_time = cur_time + interval_ns * count;
 	}
 
+	video->total_frames += count;
+	video->lagged_frames += count - 1;
+
 	vframe_info.timestamp = cur_time;
 	vframe_info.count = count;
 	circlebuf_push_back(&video->vframe_info_buffer, &vframe_info,
@@ -601,6 +564,8 @@ static inline void output_frame(void)
 		video->cur_texture = 0;
 }
 
+#define NBSP "\xC2\xA0"
+
 static const char *tick_sources_name = "tick_sources";
 static const char *render_displays_name = "render_displays";
 static const char *output_frame_name = "output_frame";
@@ -608,6 +573,8 @@ void *obs_video_thread(void *param)
 {
 	uint64_t last_time = 0;
 	uint64_t interval = video_output_get_frame_time(obs->video.video);
+	uint64_t fps_total_ns = 0;
+	uint32_t fps_total_frames = 0;
 
 	obs->video.video_time = os_gettime_ns();
 
@@ -615,7 +582,7 @@ void *obs_video_thread(void *param)
 
 	const char *video_thread_name =
 		profile_store_name(obs_get_profiler_name_store(),
-			"obs_video_thread(%g ms)", interval / 1000000.);
+			"obs_video_thread(%g"NBSP"ms)", interval / 1000000.);
 	profile_register_root(video_thread_name, interval);
 
 	while (!video_output_stopped(obs->video.video)) {
@@ -638,6 +605,16 @@ void *obs_video_thread(void *param)
 		profile_reenable_thread();
 
 		video_sleep(&obs->video, &obs->video.video_time, interval);
+
+		fps_total_ns += (obs->video.video_time - last_time);
+		fps_total_frames++;
+
+		if (fps_total_ns >= 1000000000ULL) {
+			obs->video.video_fps = (double)fps_total_frames /
+				((double)fps_total_ns / 1000000000.0);
+			fps_total_ns = 0;
+			fps_total_frames = 0;
+		}
 	}
 
 	UNUSED_PARAMETER(param);

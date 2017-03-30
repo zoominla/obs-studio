@@ -62,13 +62,28 @@ struct list_data {
 };
 
 struct editable_list_data {
-	bool                        allow_files;
+	enum obs_editable_list_type type;
 	char                        *filter;
 	char                        *default_path;
 };
 
 struct button_data {
 	obs_property_clicked_t callback;
+};
+
+struct frame_rate_option {
+	char *name;
+	char *description;
+};
+
+struct frame_rate_range {
+	struct media_frames_per_second min_time;
+	struct media_frames_per_second max_time;
+};
+
+struct frame_rate_data {
+	DARRAY(struct frame_rate_option) extra_options;
+	DARRAY(struct frame_rate_range)  ranges;
 };
 
 static inline void path_data_free(struct path_data *data)
@@ -100,11 +115,37 @@ static inline void list_data_free(struct list_data *data)
 	da_free(data->items);
 }
 
+static inline void frame_rate_data_options_free(struct frame_rate_data *data)
+{
+	for (size_t i = 0; i < data->extra_options.num; i++) {
+		struct frame_rate_option *opt = &data->extra_options.array[i];
+		bfree(opt->name);
+		bfree(opt->description);
+	}
+
+	da_resize(data->extra_options, 0);
+}
+
+static inline void frame_rate_data_ranges_free(struct frame_rate_data *data)
+{
+	da_resize(data->ranges, 0);
+}
+
+static inline void frame_rate_data_free(struct frame_rate_data *data)
+{
+	frame_rate_data_options_free(data);
+	frame_rate_data_ranges_free(data);
+
+	da_free(data->extra_options);
+	da_free(data->ranges);
+}
+
 struct obs_properties;
 
 struct obs_property {
 	const char              *name;
 	const char              *desc;
+	const char              *long_desc;
 	enum obs_property_type  type;
 	bool                    visible;
 	bool                    enabled;
@@ -178,6 +219,8 @@ static void obs_property_destroy(struct obs_property *property)
 		path_data_free(get_property_data(property));
 	else if (property->type == OBS_PROPERTY_EDITABLE_LIST)
 		editable_list_data_free(get_property_data(property));
+	else if (property->type == OBS_PROPERTY_FRAME_RATE)
+		frame_rate_data_free(get_property_data(property));
 
 	bfree(property);
 }
@@ -262,6 +305,7 @@ static inline size_t get_property_size(enum obs_property_type type)
 	case OBS_PROPERTY_FONT:      return 0;
 	case OBS_PROPERTY_EDITABLE_LIST:
 		return sizeof(struct editable_list_data);
+	case OBS_PROPERTY_FRAME_RATE:return sizeof(struct frame_rate_data);
 	}
 
 	return 0;
@@ -460,7 +504,7 @@ obs_property_t *obs_properties_add_font(obs_properties_t *props,
 
 obs_property_t *obs_properties_add_editable_list(obs_properties_t *props,
 		const char *name, const char *desc,
-		bool allow_files, const char *filter,
+		enum obs_editable_list_type type, const char *filter,
 		const char *default_path)
 {
 	if (!props || has_prop(props, name)) return NULL;
@@ -468,9 +512,23 @@ obs_property_t *obs_properties_add_editable_list(obs_properties_t *props,
 			OBS_PROPERTY_EDITABLE_LIST);
 
 	struct editable_list_data *data = get_property_data(p);
-	data->allow_files = allow_files;
+	data->type = type;
 	data->filter = bstrdup(filter);
 	data->default_path = bstrdup(default_path);
+	return p;
+}
+
+obs_property_t *obs_properties_add_frame_rate(obs_properties_t *props,
+		const char *name, const char *desc)
+{
+	if (!props || has_prop(props, name)) return NULL;
+
+	struct obs_property *p = new_prop(props, name, desc,
+			OBS_PROPERTY_FRAME_RATE);
+
+	struct frame_rate_data *data = get_property_data(p);
+	da_init(data->extra_options);
+	da_init(data->ranges);
 	return p;
 }
 
@@ -493,7 +551,7 @@ static inline struct list_data *get_list_fmt_data(struct obs_property *p,
 		enum obs_combo_format format)
 {
 	struct list_data *data = get_list_data(p);
-	return (data->format == format) ? data : NULL;
+	return (data && data->format == format) ? data : NULL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -527,7 +585,8 @@ bool obs_property_button_clicked(obs_property_t *p, void *obj)
 		struct button_data *data = get_type_data(p,
 				OBS_PROPERTY_BUTTON);
 		if (data && data->callback)
-			return data->callback(p->parent, p, context->data);
+			return data->callback(p->parent, p,
+					(context ? context->data : NULL));
 	}
 
 	return false;
@@ -548,6 +607,11 @@ void obs_property_set_description(obs_property_t *p, const char *description)
 	if (p) p->desc = description;
 }
 
+void obs_property_set_long_description(obs_property_t *p, const char *long_desc)
+{
+	if (p) p->long_desc = long_desc;
+}
+
 const char *obs_property_name(obs_property_t *p)
 {
 	return p ? p->name : NULL;
@@ -556,6 +620,11 @@ const char *obs_property_name(obs_property_t *p)
 const char *obs_property_description(obs_property_t *p)
 {
 	return p ? p->desc : NULL;
+}
+
+const char *obs_property_long_description(obs_property_t *p)
+{
+	return p ? p->long_desc : NULL;
 }
 
 enum obs_property_type obs_property_get_type(obs_property_t *p)
@@ -655,6 +724,30 @@ enum obs_combo_format obs_property_list_format(obs_property_t *p)
 {
 	struct list_data *data = get_list_data(p);
 	return data ? data->format : OBS_COMBO_FORMAT_INVALID;
+}
+
+void obs_property_int_set_limits(obs_property_t *p,
+		int min, int max, int step)
+{
+	struct int_data *data = get_type_data(p, OBS_PROPERTY_INT);
+	if (!data)
+		return;
+
+	data->min = min;
+	data->max = max;
+	data->step = step;
+}
+
+void obs_property_float_set_limits(obs_property_t *p,
+		double min, double max, double step)
+{
+	struct float_data *data = get_type_data(p, OBS_PROPERTY_INT);
+	if (!data)
+		return;
+
+	data->min = min;
+	data->max = max;
+	data->step = step;
 }
 
 void obs_property_list_clear(obs_property_t *p)
@@ -806,11 +899,11 @@ double obs_property_list_item_float(obs_property_t *p, size_t idx)
 		data->items.array[idx].d : 0.0;
 }
 
-bool obs_property_editable_list_allow_files(obs_property_t *p)
+enum obs_editable_list_type obs_property_editable_list_type(obs_property_t *p)
 {
 	struct editable_list_data *data = get_type_data(p,
 			OBS_PROPERTY_EDITABLE_LIST);
-	return data ? data->allow_files : false;
+	return data ? data->type : OBS_EDITABLE_LIST_TYPE_STRINGS;
 }
 
 const char *obs_property_editable_list_filter(obs_property_t *p)
@@ -825,4 +918,144 @@ const char *obs_property_editable_list_default_path(obs_property_t *p)
 	struct editable_list_data *data = get_type_data(p,
 			OBS_PROPERTY_EDITABLE_LIST);
 	return data ? data->default_path : NULL;
+}
+
+/* ------------------------------------------------------------------------- */
+/* OBS_PROPERTY_FRAME_RATE */
+
+void obs_property_frame_rate_clear(obs_property_t *p)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return;
+
+	frame_rate_data_options_free(data);
+	frame_rate_data_ranges_free(data);
+}
+
+void obs_property_frame_rate_options_clear(obs_property_t *p)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return;
+
+	frame_rate_data_options_free(data);
+}
+
+void obs_property_frame_rate_fps_ranges_clear(obs_property_t *p)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return;
+
+	frame_rate_data_ranges_free(data);
+}
+
+size_t obs_property_frame_rate_option_add(obs_property_t *p,
+		const char *name, const char *description)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return DARRAY_INVALID;
+
+	struct frame_rate_option *opt = da_push_back_new(data->extra_options);
+
+	opt->name        = bstrdup(name);
+	opt->description = bstrdup(description);
+
+	return data->extra_options.num - 1;
+}
+
+size_t obs_property_frame_rate_fps_range_add(obs_property_t *p,
+		struct media_frames_per_second min,
+		struct media_frames_per_second max)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return DARRAY_INVALID;
+
+	struct frame_rate_range *rng = da_push_back_new(data->ranges);
+
+	rng->min_time = min;
+	rng->max_time = max;
+
+	return data->ranges.num - 1;
+}
+
+void obs_property_frame_rate_option_insert(obs_property_t *p, size_t idx,
+		const char *name, const char *description)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return;
+
+	struct frame_rate_option *opt = da_insert_new(data->extra_options, idx);
+
+	opt->name        = bstrdup(name);
+	opt->description = bstrdup(description);
+}
+
+void obs_property_frame_rate_fps_range_insert(obs_property_t *p, size_t idx,
+		struct media_frames_per_second min,
+		struct media_frames_per_second max)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	if (!data) return;
+
+	struct frame_rate_range *rng = da_insert_new(data->ranges, idx);
+
+	rng->min_time = min;
+	rng->max_time = max;
+}
+
+size_t obs_property_frame_rate_options_count(obs_property_t *p)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	return data ? data->extra_options.num : 0;
+}
+
+const char *obs_property_frame_rate_option_name(obs_property_t *p,
+		size_t idx)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	return data && data->extra_options.num > idx ?
+		data->extra_options.array[idx].name : NULL;
+}
+
+const char *obs_property_frame_rate_option_description(
+		obs_property_t *p, size_t idx)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	return data && data->extra_options.num > idx ?
+		data->extra_options.array[idx].description : NULL;
+}
+
+size_t obs_property_frame_rate_fps_ranges_count(obs_property_t *p)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	return data ? data->ranges.num : 0;
+}
+
+struct media_frames_per_second obs_property_frame_rate_fps_range_min(
+		obs_property_t *p, size_t idx)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	return data && data->ranges.num > idx ?
+		data->ranges.array[idx].min_time :
+		(struct media_frames_per_second){0};
+}
+struct media_frames_per_second obs_property_frame_rate_fps_range_max(
+		obs_property_t *p, size_t idx)
+{
+	struct frame_rate_data *data =
+		get_type_data(p, OBS_PROPERTY_FRAME_RATE);
+	return data && data->ranges.num > idx ?
+		data->ranges.array[idx].max_time :
+		(struct media_frames_per_second){0};
 }

@@ -157,18 +157,20 @@ static void log_processor_cores(void)
 
 static void log_available_memory(void)
 {
-	MEMORYSTATUS ms;
-	GlobalMemoryStatus(&ms);
+	MEMORYSTATUSEX ms;
+	ms.dwLength = sizeof(ms);
+
+	GlobalMemoryStatusEx(&ms);
 
 #ifdef _WIN64
 	const char *note = "";
 #else
-	const char *note = " (NOTE: 4 gigs max is normal for 32bit programs)";
+	const char *note = " (NOTE: 32bit programs cannot use more than 3gb)";
 #endif
 
 	blog(LOG_INFO, "Physical Memory: %luMB Total, %luMB Free%s",
-			(DWORD)(ms.dwTotalPhys / 1048576),
-			(DWORD)(ms.dwAvailPhys / 1048576),
+			(DWORD)(ms.ullTotalPhys / 1048576),
+			(DWORD)(ms.ullAvailPhys / 1048576),
 			note);
 }
 
@@ -177,8 +179,31 @@ static void log_windows_version(void)
 	struct win_version_info ver;
 	get_win_ver(&ver);
 
-	blog(LOG_INFO, "Windows Version: %d.%d Build %d (revision: %d)",
-			ver.major, ver.minor, ver.build, ver.revis);
+	bool b64 = is_64_bit_windows();
+	const char *windows_bitness = b64 ? "64" : "32";
+
+	blog(LOG_INFO, "Windows Version: %d.%d Build %d (revision: %d; %s-bit)",
+			ver.major, ver.minor, ver.build, ver.revis,
+			windows_bitness);
+}
+
+static void log_admin_status(void)
+{
+	SID_IDENTIFIER_AUTHORITY auth = SECURITY_NT_AUTHORITY;
+	PSID admin_group;
+	BOOL success;
+
+	success = AllocateAndInitializeSid(&auth, 2,
+			SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+			0, 0, 0, 0, 0, 0, &admin_group);
+	if (success) {
+		if (!CheckTokenMembership(NULL, admin_group, &success))
+			success = false;
+		FreeSid(admin_group);
+	}
+
+	blog(LOG_INFO, "Running as administrator: %s",
+			success ? "true" : "false");
 }
 
 typedef HRESULT (WINAPI *dwm_is_composition_enabled_t)(BOOL*);
@@ -219,6 +244,7 @@ void log_system_info(void)
 	log_processor_cores();
 	log_available_memory();
 	log_windows_version();
+	log_admin_status();
 	log_aero();
 }
 
@@ -384,8 +410,8 @@ static bool vk_down(DWORD vk)
 {
 	short state = GetAsyncKeyState(vk);
 	bool down = (state & 0x8000) != 0;
-	bool was_down = (state & 0x1) != 0;
-	return down || was_down;
+
+	return down;
 }
 
 bool obs_hotkeys_platform_is_pressed(obs_hotkeys_platform_t *context,
@@ -508,22 +534,6 @@ void obs_key_combination_to_str(obs_key_combination_t combination,
 	}
 }
 
-static char *get_abs_path(const char *path)
-{
-	wchar_t wpath[512];
-	wchar_t wabspath[512];
-	char *abspath = NULL;
-	size_t len;
-
-	len = os_utf8_to_wcs(path, 0, wpath, 512);
-	if (!len)
-		return NULL;
-
-	if (_wfullpath(wabspath, wpath, 512) != NULL)
-		os_wcs_to_utf8_ptr(wabspath, 0, &abspath);
-	return abspath;
-}
-
 bool sym_initialize_called = false;
 
 void reset_win32_symbol_paths(void)
@@ -561,7 +571,7 @@ void reset_win32_symbol_paths(void)
 	if (!initialize_success)
 		return;
 
-	abspath = get_abs_path(".");
+	abspath = os_get_abs_path_ptr(".");
 	if (abspath)
 		da_push_back(paths, &abspath);
 
@@ -591,7 +601,7 @@ void reset_win32_symbol_paths(void)
 		}
 
 		if (!found) {
-			abspath = get_abs_path(path.array);
+			abspath = os_get_abs_path_ptr(path.array);
 			if (abspath)
 				da_push_back(paths, &abspath);
 		}

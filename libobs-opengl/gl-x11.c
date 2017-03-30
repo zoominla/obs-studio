@@ -61,6 +61,7 @@ static int ctx_visual_attribs[] = {
 	GLX_BUFFER_SIZE, 32,
 	GLX_DOUBLEBUFFER, true,
 	GLX_X_RENDERABLE, true,
+	None
 };
 
 struct gl_windowinfo {
@@ -560,12 +561,45 @@ extern void device_load_swapchain(gs_device_t *device, gs_swapchain_t *swap)
 	}
 }
 
+enum swap_type {
+	SWAP_TYPE_NORMAL,
+	SWAP_TYPE_EXT,
+	SWAP_TYPE_MESA,
+	SWAP_TYPE_SGI,
+};
+
 extern void device_present(gs_device_t *device)
 {
+	static bool initialized = false;
+	static enum swap_type swap_type = SWAP_TYPE_NORMAL;
+
 	Display *display = device->plat->display;
 	XID window = device->cur_swap->wi->window;
 
-	/* TODO: Handle XCB events. */
+	if (!initialized) {
+		if (GLAD_GLX_EXT_swap_control)
+			swap_type = SWAP_TYPE_EXT;
+		else if (GLAD_GLX_MESA_swap_control)
+			swap_type = SWAP_TYPE_MESA;
+		else if (GLAD_GLX_SGI_swap_control)
+			swap_type = SWAP_TYPE_SGI;
+
+		initialized = true;
+	}
+
+	xcb_connection_t *xcb_conn = XGetXCBConnection(display);
+	xcb_generic_event_t *xcb_event;
+	while((xcb_event = xcb_poll_for_event(xcb_conn))) {
+		/* TODO: Handle XCB events. */
+		free(xcb_event);
+	}
+
+	switch (swap_type) {
+	case SWAP_TYPE_EXT:    glXSwapIntervalEXT(display, window, 0); break;
+	case SWAP_TYPE_MESA:   glXSwapIntervalMESA(0); break;
+	case SWAP_TYPE_SGI:    glXSwapIntervalSGI(0); break;
+	case SWAP_TYPE_NORMAL:;
+	}
 
 	glXSwapBuffers(display, window);
 }

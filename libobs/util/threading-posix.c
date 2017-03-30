@@ -246,21 +246,6 @@ int  os_sem_wait(os_sem_t *sem)
 
 #endif
 
-long os_atomic_inc_long(volatile long *val)
-{
-	return __sync_add_and_fetch(val, 1);
-}
-
-long os_atomic_dec_long(volatile long *val)
-{
-	return __sync_sub_and_fetch(val, 1);
-}
-
-bool os_atomic_compare_swap_long(volatile long *val, long old_val, long new_val)
-{
-	return __sync_bool_compare_and_swap(val, old_val, new_val);
-}
-
 void os_set_thread_name(const char *name)
 {
 #if defined(__APPLE__)

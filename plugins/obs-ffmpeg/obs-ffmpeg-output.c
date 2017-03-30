@@ -23,6 +23,7 @@
 #include <util/platform.h>
 
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
 
@@ -35,6 +36,7 @@ struct ffmpeg_cfg {
 	const char         *format_name;
 	const char         *format_mime_type;
 	const char         *muxer_settings;
+	int                gop_size;
 	int                video_bitrate;
 	int                audio_bitrate;
 	const char         *video_encoder;
@@ -89,6 +91,11 @@ struct ffmpeg_output {
 	bool               connecting;
 	pthread_t          start_thread;
 
+	uint64_t           audio_start_ts;
+	uint64_t           video_start_ts;
+	uint64_t           stop_ts;
+	volatile bool      stopping;
+
 	bool               write_thread_active;
 	pthread_mutex_t    write_mutex;
 	pthread_t          write_thread;
@@ -124,10 +131,12 @@ static bool new_stream(struct ffmpeg_data *data, AVStream **stream,
 	return true;
 }
 
-static void parse_params(AVCodecContext *context, char **opts)
+static bool parse_params(AVCodecContext *context, char **opts)
 {
+	bool ret = true;
+
 	if (!context || !context->priv_data)
-		return;
+		return true;
 
 	while (*opts) {
 		char *opt = *opts;
@@ -140,11 +149,16 @@ static void parse_params(AVCodecContext *context, char **opts)
 			*assign = 0;
 			value = assign+1;
 
-			av_opt_set(context->priv_data, name, value, 0);
+			if (av_opt_set(context->priv_data, name, value, 0)) {
+				blog(LOG_WARNING, "Failed to set %s=%s", name, value);
+				ret = false;
+			}
 		}
 
 		opts++;
 	}
+
+	return ret;
 }
 
 static bool open_video_codec(struct ffmpeg_data *data)
@@ -157,7 +171,9 @@ static bool open_video_codec(struct ffmpeg_data *data)
 		av_opt_set(context->priv_data, "preset", "veryfast", 0);
 
 	if (opts) {
-		parse_params(context, opts);
+		// libav requires x264 parameters in a special format which may be non-obvious
+		if (!parse_params(context, opts) && strcmp(data->vcodec->name, "libx264") == 0)
+			blog(LOG_WARNING, "If you're trying to set x264 parameters, use x264-params=name=value:name=value");
 		strlist_free(opts);
 	}
 
@@ -233,10 +249,11 @@ static bool create_video_stream(struct ffmpeg_data *data)
 	context->width          = data->config.scale_width;
 	context->height         = data->config.scale_height;
 	context->time_base      = (AVRational){ ovi.fps_den, ovi.fps_num };
-	context->gop_size       = 120;
+	context->gop_size       = data->config.gop_size;
 	context->pix_fmt        = closest_format;
 	context->colorspace     = data->config.color_space;
 	context->color_range    = data->config.color_range;
+	context->thread_count   = 0;
 
 	data->video->time_base = context->time_base;
 
@@ -260,7 +277,7 @@ static bool create_video_stream(struct ffmpeg_data *data)
 static bool open_audio_codec(struct ffmpeg_data *data)
 {
 	AVCodecContext *context = data->audio->codec;
-	char **opts = strlist_split(data->config.video_settings, ' ', false);
+	char **opts = strlist_split(data->config.audio_settings, ' ', false);
 	int ret;
 
 	if (opts) {
@@ -548,6 +565,11 @@ fail:
 
 /* ------------------------------------------------------------------------- */
 
+static inline bool stopping(struct ffmpeg_output *output)
+{
+	return os_atomic_load_bool(&output->stopping);
+}
+
 static const char *ffmpeg_output_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -588,7 +610,7 @@ fail:
 	return NULL;
 }
 
-static void ffmpeg_output_stop(void *data);
+static void ffmpeg_output_full_stop(void *data);
 static void ffmpeg_deactivate(struct ffmpeg_output *output);
 
 static void ffmpeg_output_destroy(void *data)
@@ -599,7 +621,7 @@ static void ffmpeg_output_destroy(void *data)
 		if (output->connecting)
 			pthread_join(output->start_thread, NULL);
 
-		ffmpeg_output_stop(output);
+		ffmpeg_output_full_stop(output);
 
 		pthread_mutex_destroy(&output->write_mutex);
 		os_sem_destroy(output->write_sem);
@@ -609,8 +631,10 @@ static void ffmpeg_output_destroy(void *data)
 }
 
 static inline void copy_data(AVPicture *pic, const struct video_data *frame,
-		int height)
+		int height, enum AVPixelFormat format)
 {
+	int h_chroma_shift, v_chroma_shift;
+	av_pix_fmt_get_chroma_sub_sample(format, &h_chroma_shift, &v_chroma_shift);
 	for (int plane = 0; plane < MAX_AV_PLANES; plane++) {
 		if (!frame->data[plane])
 			continue;
@@ -619,7 +643,7 @@ static inline void copy_data(AVPicture *pic, const struct video_data *frame,
 		int pic_rowsize   = pic->linesize[plane];
 		int bytes = frame_rowsize < pic_rowsize ?
 			frame_rowsize : pic_rowsize;
-		int plane_height = plane == 0 ? height : height/2;
+		int plane_height = height >> (plane ? v_chroma_shift : 0);
 
 		for (int y = 0; y < plane_height; y++) {
 			int pos_frame = y * frame_rowsize;
@@ -647,6 +671,8 @@ static void receive_video(void *param, struct video_data *frame)
 
 	av_init_packet(&packet);
 
+	if (!output->video_start_ts)
+		output->video_start_ts = frame->timestamp;
 	if (!data->start_timestamp)
 		data->start_timestamp = frame->timestamp;
 
@@ -656,7 +682,7 @@ static void receive_video(void *param, struct video_data *frame)
 				0, data->config.height, data->dst_picture.data,
 				data->dst_picture.linesize);
 	else
-		copy_data(&data->dst_picture, frame, context->height);
+		copy_data(&data->dst_picture, frame, context->height, context->pix_fmt);
 
 	if (data->output->flags & AVFMT_RAWPICTURE) {
 		packet.flags        |= AV_PKT_FLAG_KEY;
@@ -768,6 +794,8 @@ static bool prepare_audio(struct ffmpeg_data *data,
 			return false;
 
 		cutoff = data->start_timestamp - frame->timestamp;
+		output->timestamp += cutoff;
+
 		cutoff = cutoff * (uint64_t)data->audio_samplerate /
 			1000000000;
 
@@ -797,6 +825,9 @@ static void receive_audio(void *param, struct audio_data *frame)
 	if (!prepare_audio(data, frame, &in))
 		return;
 
+	if (!output->audio_start_ts)
+		output->audio_start_ts = in.timestamp;
+
 	frame_size_bytes = (size_t)data->frame_size * data->audio_size;
 
 	for (size_t i = 0; i < data->audio_planes; i++)
@@ -810,6 +841,26 @@ static void receive_audio(void *param, struct audio_data *frame)
 
 		encode_audio(output, context, data->audio_size);
 	}
+}
+
+static uint64_t get_packet_sys_dts(struct ffmpeg_output *output,
+		AVPacket *packet)
+{
+	struct ffmpeg_data *data = &output->ff_data;
+	uint64_t start_ts;
+
+	AVRational time_base;
+
+	if (data->video && data->video->index == packet->stream_index) {
+		time_base = data->video->time_base;
+		start_ts = output->video_start_ts;
+	} else {
+		time_base = data->audio->time_base;
+		start_ts = output->audio_start_ts;
+	}
+
+	return start_ts + (uint64_t)av_rescale_q(packet->dts,
+			time_base, (AVRational){1, 1000000000});
 }
 
 static int process_packet(struct ffmpeg_output *output)
@@ -833,6 +884,14 @@ static int process_packet(struct ffmpeg_output *output)
 			"packets queued: %lu",
 			packet.size, packet.flags,
 			packet.stream_index, output->packets.num);*/
+
+	if (stopping(output)) {
+		uint64_t sys_ts = get_packet_sys_dts(output, &packet);
+		if (sys_ts >= output->stop_ts) {
+			ffmpeg_output_full_stop(output);
+			return 0;
+		}
+	}
 
 	ret = av_interleaved_write_frame(output->ff_data.output, &packet);
 	if (ret < 0) {
@@ -893,6 +952,9 @@ static bool try_connect(struct ffmpeg_output *output)
 	int ret;
 
 	settings = obs_output_get_settings(output->output);
+
+	obs_data_set_default_int(settings, "gop_size", 120);
+
 	config.url = obs_data_get_string(settings, "url");
 	config.format_name = get_string_or_null(settings, "format_name");
 	config.format_mime_type = get_string_or_null(settings,
@@ -900,6 +962,7 @@ static bool try_connect(struct ffmpeg_output *output)
 	config.muxer_settings = obs_data_get_string(settings, "muxer_settings");
 	config.video_bitrate = (int)obs_data_get_int(settings, "video_bitrate");
 	config.audio_bitrate = (int)obs_data_get_int(settings, "audio_bitrate");
+	config.gop_size = (int)obs_data_get_int(settings, "gop_size");
 	config.video_encoder = get_string_or_null(settings, "video_encoder");
 	config.video_encoder_id = (int)obs_data_get_int(settings,
 			"video_encoder_id");
@@ -954,7 +1017,7 @@ static bool try_connect(struct ffmpeg_output *output)
 	if (ret != 0) {
 		blog(LOG_WARNING, "ffmpeg_output_start: failed to create write "
 		                  "thread.");
-		ffmpeg_output_stop(output);
+		ffmpeg_output_full_stop(output);
 		return false;
 	}
 
@@ -985,17 +1048,35 @@ static bool ffmpeg_output_start(void *data)
 	if (output->connecting)
 		return false;
 
+	os_atomic_set_bool(&output->stopping, false);
+	output->audio_start_ts = 0;
+	output->video_start_ts = 0;
+
 	ret = pthread_create(&output->start_thread, NULL, start_thread, output);
 	return (output->connecting = (ret == 0));
 }
 
-static void ffmpeg_output_stop(void *data)
+static void ffmpeg_output_full_stop(void *data)
 {
 	struct ffmpeg_output *output = data;
 
 	if (output->active) {
 		obs_output_end_data_capture(output->output);
 		ffmpeg_deactivate(output);
+	}
+}
+
+static void ffmpeg_output_stop(void *data, uint64_t ts)
+{
+	struct ffmpeg_output *output = data;
+
+	if (output->active) {
+		if (ts == 0) {
+			ffmpeg_output_full_stop(output);
+		} else {
+			os_atomic_set_bool(&output->stopping, true);
+			output->stop_ts = ts;
+		}
 	}
 }
 

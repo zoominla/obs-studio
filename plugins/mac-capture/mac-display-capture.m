@@ -263,7 +263,7 @@ static void *display_capture_create(obs_data_t *settings,
 	dc->source = source;
 	dc->hide_cursor = !obs_data_get_bool(settings, "show_cursor");
 
-	dc->effect = obs_get_default_rect_effect();
+	dc->effect = obs_get_base_effect(OBS_EFFECT_DEFAULT_RECT);
 	if (!dc->effect)
 		goto fail;
 
@@ -657,7 +657,8 @@ struct obs_source_info display_capture_info = {
 	.create         = display_capture_create,
 	.destroy        = display_capture_destroy,
 
-	.output_flags   = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
+	.output_flags   = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW |
+	                  OBS_SOURCE_DO_NOT_DUPLICATE,
 	.video_tick     = display_capture_video_tick,
 	.video_render   = display_capture_video_render,
 

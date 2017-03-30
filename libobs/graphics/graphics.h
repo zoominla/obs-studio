@@ -284,6 +284,9 @@ enum gs_shader_param_type {
 	GS_SHADER_PARAM_VEC2,
 	GS_SHADER_PARAM_VEC3,
 	GS_SHADER_PARAM_VEC4,
+	GS_SHADER_PARAM_INT2,
+	GS_SHADER_PARAM_INT3,
+	GS_SHADER_PARAM_INT4,
 	GS_SHADER_PARAM_MATRIX4X4,
 	GS_SHADER_PARAM_TEXTURE,
 };
@@ -314,7 +317,7 @@ EXPORT void gs_shader_get_param_info(const gs_sparam_t *param,
 EXPORT void gs_shader_set_bool(gs_sparam_t *param, bool val);
 EXPORT void gs_shader_set_float(gs_sparam_t *param, float val);
 EXPORT void gs_shader_set_int(gs_sparam_t *param, int val);
-EXPORT void gs_shader_setmatrix3(gs_sparam_t *param, const struct matrix3 *val);
+EXPORT void gs_shader_set_matrix3(gs_sparam_t *param, const struct matrix3 *val);
 EXPORT void gs_shader_set_matrix4(gs_sparam_t *param, const struct matrix4 *val);
 EXPORT void gs_shader_set_vec2(gs_sparam_t *param, const struct vec2 *val);
 EXPORT void gs_shader_set_vec3(gs_sparam_t *param, const struct vec3 *val);
@@ -322,6 +325,8 @@ EXPORT void gs_shader_set_vec4(gs_sparam_t *param, const struct vec4 *val);
 EXPORT void gs_shader_set_texture(gs_sparam_t *param, gs_texture_t *val);
 EXPORT void gs_shader_set_val(gs_sparam_t *param, const void *val, size_t size);
 EXPORT void gs_shader_set_default(gs_sparam_t *param);
+EXPORT void gs_shader_set_next_sampler(gs_sparam_t *param,
+		gs_samplerstate_t *sampler);
 
 /* ---------------------------------------------------
  * effect functions
@@ -390,6 +395,8 @@ EXPORT void gs_effect_set_vec4(gs_eparam_t *param, const struct vec4 *val);
 EXPORT void gs_effect_set_texture(gs_eparam_t *param, gs_texture_t *val);
 EXPORT void gs_effect_set_val(gs_eparam_t *param, const void *val, size_t size);
 EXPORT void gs_effect_set_default(gs_eparam_t *param);
+EXPORT void gs_effect_set_next_sampler(gs_eparam_t *param,
+		gs_samplerstate_t *sampler);
 
 /* ---------------------------------------------------
  * texture render helper functions
@@ -502,6 +509,8 @@ EXPORT gs_shader_t *gs_pixelshader_create_from_file(const char *file,
 		char **error_string);
 
 EXPORT gs_texture_t *gs_texture_create_from_file(const char *file);
+EXPORT uint8_t *gs_create_texture_file_data(const char *file,
+		enum gs_color_format *format, uint32_t *cx, uint32_t *cy);
 
 #define GS_FLIP_U (1<<0)
 #define GS_FLIP_V (1<<1)
@@ -515,6 +524,9 @@ EXPORT gs_texture_t *gs_texture_create_from_file(const char *file);
  */
 EXPORT void gs_draw_sprite(gs_texture_t *tex, uint32_t flip, uint32_t width,
 		uint32_t height);
+
+EXPORT void gs_draw_sprite_subregion(gs_texture_t *tex, uint32_t flip,
+		uint32_t x, uint32_t y, uint32_t cx, uint32_t cy);
 
 EXPORT void gs_draw_cube_backdrop(gs_texture_t *cubetex, const struct quat *rot,
 		float left, float right, float top, float bottom, float znear);
@@ -685,7 +697,7 @@ EXPORT enum gs_color_format gs_cubetexture_get_color_format(
 EXPORT void     gs_voltexture_destroy(gs_texture_t *voltex);
 EXPORT uint32_t gs_voltexture_get_width(const gs_texture_t *voltex);
 EXPORT uint32_t gs_voltexture_get_height(const gs_texture_t *voltex);
-EXPORT uint32_t gs_voltexture_getdepth(const gs_texture_t *voltex);
+EXPORT uint32_t gs_voltexture_get_depth(const gs_texture_t *voltex);
 EXPORT enum gs_color_format gs_voltexture_get_color_format(
 		const gs_texture_t *voltex);
 

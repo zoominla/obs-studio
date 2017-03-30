@@ -16,6 +16,7 @@
 
 #define _FILE_OFFSET_BITS 64
 
+#include <time.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <locale.h>
@@ -85,6 +86,37 @@ int64_t os_fgetsize(FILE *file)
 	return size;
 }
 
+#ifdef _WIN32
+int os_stat(const char *file, struct stat *st)
+{
+	if (file) {
+		wchar_t w_file[512];
+		size_t size = os_utf8_to_wcs(file, 0, w_file, sizeof(w_file));
+		if (size > 0) {
+			struct _stat st_w32;
+			int ret = _wstat(w_file, &st_w32);
+			if (ret == 0) {
+				st->st_dev = st_w32.st_dev;
+				st->st_ino = st_w32.st_ino;
+				st->st_mode = st_w32.st_mode;
+				st->st_nlink = st_w32.st_nlink;
+				st->st_uid = st_w32.st_uid;
+				st->st_gid = st_w32.st_gid;
+				st->st_rdev = st_w32.st_rdev;
+				st->st_size = st_w32.st_size;
+				st->st_atime = st_w32.st_atime;
+				st->st_mtime = st_w32.st_mtime;
+				st->st_ctime = st_w32.st_ctime;
+			}
+
+			return ret;
+		}
+	}
+
+	return -1;
+}
+#endif
+
 int os_fseeki64(FILE *file, int64_t offset, int origin)
 {
 #ifdef _MSC_VER
@@ -133,7 +165,6 @@ size_t os_fread_mbs(FILE *file, char **pstr)
 size_t os_fread_utf8(FILE *file, char **pstr)
 {
 	size_t size = 0;
-	size_t size_read;
 	size_t len = 0;
 
 	*pstr = NULL;
@@ -146,11 +177,13 @@ size_t os_fread_utf8(FILE *file, char **pstr)
 		char *utf8str;
 		off_t offset;
 
+		bom[0] = 0;
+		bom[1] = 0;
+		bom[2] = 0;
+
 		/* remove the ghastly BOM if present */
 		fseek(file, 0, SEEK_SET);
-		size_read = fread(bom, 1, 3, file);
-		if (size_read != 3)
-			return 0;
+		fread(bom, 1, 3, file);
 
 		offset = (astrcmp_n(bom, "\xEF\xBB\xBF", 3) == 0) ? 3 : 0;
 
@@ -280,6 +313,18 @@ cleanup:
 	dstr_free(&backup_path);
 	dstr_free(&temp_path);
 	return success;
+}
+
+int64_t os_get_file_size(const char *path)
+{
+	FILE* f = os_fopen(path, "rb");
+	if (!f)
+		return -1;
+
+	int64_t sz = os_fgetsize(f);
+	fclose(f);
+
+	return sz;
 }
 
 size_t os_mbs_to_wcs(const char *str, size_t len, wchar_t *dst, size_t dst_size)
@@ -589,4 +634,147 @@ int os_mkdirs(const char *dir)
 	ret = recursive_mkdir(dir_str.array);
 	dstr_free(&dir_str);
 	return ret;
+}
+
+const char *os_get_path_extension(const char *path)
+{
+	struct dstr temp;
+	size_t pos = 0;
+	char *period;
+	char *slash;
+
+	dstr_init_copy(&temp, path);
+	dstr_replace(&temp, "\\", "/");
+
+	slash = strrchr(temp.array, '/');
+	period = strrchr(temp.array, '.');
+	if (period)
+		pos = (size_t)(period - temp.array);
+
+	dstr_free(&temp);
+
+	if (!period || slash > period)
+		return NULL;
+
+	return path + pos;
+}
+
+static inline bool valid_string(const char *str)
+{
+	while (str && *str) {
+		if (*(str++) != ' ')
+			return true;
+	}
+
+	return false;
+}
+
+static void replace_text(struct dstr *str, size_t pos, size_t len,
+		const char *new_text)
+{
+	struct dstr front = {0};
+	struct dstr back = {0};
+
+	dstr_left(&front, str, pos);
+	dstr_right(&back, str, pos + len);
+	dstr_copy_dstr(str, &front);
+	dstr_cat(str, new_text);
+	dstr_cat_dstr(str, &back);
+	dstr_free(&front);
+	dstr_free(&back);
+}
+
+static void erase_ch(struct dstr *str, size_t pos)
+{
+	struct dstr new_str = {0};
+	dstr_left(&new_str, str, pos);
+	dstr_cat(&new_str, str->array + pos + 1);
+	dstr_free(str);
+	*str = new_str;
+}
+
+char *os_generate_formatted_filename(const char *extension, bool space,
+		const char *format)
+{
+	time_t now = time(0);
+	struct tm *cur_time;
+	cur_time = localtime(&now);
+
+	const size_t spec_count = 23;
+	static const char *spec[][2] = {
+		{"%CCYY", "%Y"},
+		{"%YY",   "%y"},
+		{"%MM",   "%m"},
+		{"%DD",   "%d"},
+		{"%hh",   "%H"},
+		{"%mm",   "%M"},
+		{"%ss",   "%S"},
+		{"%%",    "%%"},
+
+		{"%a",    ""},
+		{"%A",    ""},
+		{"%b",    ""},
+		{"%B",    ""},
+		{"%d",    ""},
+		{"%H",    ""},
+		{"%I",    ""},
+		{"%m",    ""},
+		{"%M",    ""},
+		{"%p",    ""},
+		{"%S",    ""},
+		{"%y",    ""},
+		{"%Y",    ""},
+		{"%z",    ""},
+		{"%Z",    ""},
+	};
+
+	char convert[128] = {0};
+	struct dstr sf;
+	struct dstr c = {0};
+	size_t pos = 0;
+
+	dstr_init_copy(&sf, format);
+
+	while (pos < sf.len) {
+		for (size_t i = 0; i < spec_count && !convert[0]; i++) {
+			size_t len = strlen(spec[i][0]);
+
+			const char *cmp = sf.array + pos;
+
+			if (astrcmp_n(cmp, spec[i][0], len) == 0) {
+				if (strlen(spec[i][1]))
+					strftime(convert, sizeof(convert),
+							spec[i][1], cur_time);
+				else
+					strftime(convert, sizeof(convert),
+							spec[i][0], cur_time);
+
+
+				dstr_copy(&c, convert);
+				if (c.len && valid_string(c.array))
+					replace_text(&sf, pos, len, convert);
+			}
+		}
+
+		if (convert[0]) {
+			pos += strlen(convert);
+			convert[0] = 0;
+		} else if (!convert[0] && sf.array[pos] == '%') {
+			erase_ch(&sf, pos);
+		} else {
+			pos++;
+		}
+	}
+
+	if (!space)
+		dstr_replace(&sf, " ", "_");
+
+	dstr_cat_ch(&sf, '.');
+	dstr_cat(&sf, extension);
+	dstr_free(&c);
+
+	if (sf.len > 255)
+		dstr_mid(&sf, &sf, 0, 255);
+
+	return sf.array;
 }

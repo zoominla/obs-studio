@@ -432,7 +432,7 @@ static void xshm_video_render(void *vptr, gs_effect_t *effect)
 {
 	XSHM_DATA(vptr);
 
-	effect = obs_get_opaque_effect();
+	effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 
 	if (!data->texture)
 		return;
@@ -445,7 +445,7 @@ static void xshm_video_render(void *vptr, gs_effect_t *effect)
 	}
 
 	if (data->show_cursor) {
-		effect = obs_get_default_effect();
+		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 
 		while (gs_effect_loop(effect, "Draw")) {
 			xcb_xcursor_render(data->cursor);
@@ -475,7 +475,8 @@ struct obs_source_info xshm_input = {
 	.id             = "xshm_input",
 	.type           = OBS_SOURCE_TYPE_INPUT,
 	.output_flags   = OBS_SOURCE_VIDEO |
-	                  OBS_SOURCE_CUSTOM_DRAW,
+	                  OBS_SOURCE_CUSTOM_DRAW |
+	                  OBS_SOURCE_DO_NOT_DUPLICATE,
 	.get_name       = xshm_getname,
 	.create         = xshm_create,
 	.destroy        = xshm_destroy,

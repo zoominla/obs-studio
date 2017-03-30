@@ -94,12 +94,7 @@ const uint8_t *obs_avc_find_startcode(const uint8_t *p, const uint8_t *end)
 
 static inline int get_drop_priority(int priority)
 {
-	switch (priority) {
-	case OBS_NAL_PRIORITY_DISPOSABLE: return OBS_NAL_PRIORITY_DISPOSABLE;
-	case OBS_NAL_PRIORITY_LOW:        return OBS_NAL_PRIORITY_LOW;
-	}
-
-	return OBS_NAL_PRIORITY_HIGHEST;
+	return priority;
 }
 
 static void serialize_avc_data(struct serializer *s, const uint8_t *data,
@@ -137,15 +132,17 @@ void obs_parse_avc_packet(struct encoder_packet *avc_packet,
 {
 	struct array_output_data output;
 	struct serializer s;
+	long ref = 1;
 
 	array_output_serializer_init(&s, &output);
 	*avc_packet = *src;
 
+	serialize(&s, &ref, sizeof(ref));
 	serialize_avc_data(&s, src->data, src->size, &avc_packet->keyframe,
 			&avc_packet->priority);
 
-	avc_packet->data          = output.bytes.array;
-	avc_packet->size          = output.bytes.num;
+	avc_packet->data          = output.bytes.array + sizeof(ref);
+	avc_packet->size          = output.bytes.num - sizeof(ref);
 	avc_packet->drop_priority = get_drop_priority(avc_packet->priority);
 }
 
@@ -220,4 +217,59 @@ size_t obs_parse_avc_header(uint8_t **header, const uint8_t *data, size_t size)
 
 	*header = output.bytes.array;
 	return output.bytes.num;
+}
+
+void obs_extract_avc_headers(const uint8_t *packet, size_t size,
+		uint8_t **new_packet_data, size_t *new_packet_size,
+		uint8_t **header_data, size_t *header_size,
+		uint8_t **sei_data, size_t *sei_size)
+{
+	DARRAY(uint8_t) new_packet;
+	DARRAY(uint8_t) header;
+	DARRAY(uint8_t) sei;
+	const uint8_t *nal_start, *nal_end, *nal_codestart;
+	const uint8_t *end = packet + size;
+	int type;
+
+	da_init(new_packet);
+	da_init(header);
+	da_init(sei);
+
+	nal_start = obs_avc_find_startcode(packet, end);
+	nal_end = NULL;
+	while (nal_end != end) {
+		nal_codestart = nal_start;
+
+		while (nal_start < end && !*(nal_start++));
+
+		if (nal_start == end)
+			break;
+
+		type = nal_start[0] & 0x1F;
+
+		nal_end = obs_avc_find_startcode(nal_start, end);
+		if (!nal_end)
+			nal_end = end;
+
+		if (type == OBS_NAL_SPS || type == OBS_NAL_PPS) {
+			da_push_back_array(header, nal_codestart,
+					nal_end - nal_codestart);
+		} else if (type == OBS_NAL_SEI) {
+			da_push_back_array(sei, nal_codestart,
+					nal_end - nal_codestart);
+
+		} else {
+			da_push_back_array(new_packet, nal_codestart,
+					nal_end - nal_codestart);
+		}
+
+		nal_start = nal_end;
+	}
+
+	*new_packet_data = new_packet.array;
+	*new_packet_size = new_packet.num;
+	*header_data = header.array;
+	*header_size = header.num;
+	*sei_data = sei.array;
+	*sei_size = sei.num;
 }

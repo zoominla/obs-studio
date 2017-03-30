@@ -43,6 +43,7 @@ using namespace DShow;
 #define AUDIO_DEVICE_ID   "audio_device_id"
 #define COLOR_SPACE       "color_space"
 #define COLOR_RANGE       "color_range"
+#define DEACTIVATE_WNS    "deactivate_when_not_showing"
 
 #define TEXT_INPUT_NAME     obs_module_text("VideoCaptureDevice")
 #define TEXT_DEVICE         obs_module_text("Device")
@@ -74,6 +75,7 @@ using namespace DShow;
 #define TEXT_COLOR_RANGE    obs_module_text("ColorRange")
 #define TEXT_RANGE_PARTIAL  obs_module_text("ColorRange.Partial")
 #define TEXT_RANGE_FULL     obs_module_text("ColorRange.Full")
+#define TEXT_DWNS           obs_module_text("DeactivateWhenNotShowing")
 
 enum ResType {
 	ResType_Preferred,
@@ -114,6 +116,7 @@ public:
 	inline ~Decoder() {ffmpeg_decode_free(&decode);}
 
 	inline operator ffmpeg_decode*() {return &decode;}
+	inline ffmpeg_decode *operator->() {return &decode;}
 };
 
 class CriticalSection {
@@ -160,6 +163,7 @@ static DWORD CALLBACK DShowThread(LPVOID ptr);
 struct DShowInput {
 	obs_source_t *source;
 	Device       device;
+	bool         deactivateWhenNotShowing = false;
 	bool         deviceHasAudio = false;
 	bool         flip = false;
 	bool         active = false;
@@ -374,6 +378,7 @@ static inline video_format ConvertVideoFormat(VideoFormat format)
 	case VideoFormat::I420:  return VIDEO_FORMAT_I420;
 	case VideoFormat::YV12:  return VIDEO_FORMAT_I420;
 	case VideoFormat::NV12:  return VIDEO_FORMAT_NV12;
+	case VideoFormat::Y800:  return VIDEO_FORMAT_Y800;
 	case VideoFormat::YVYU:  return VIDEO_FORMAT_YVYU;
 	case VideoFormat::YUY2:  return VIDEO_FORMAT_YUY2;
 	case VideoFormat::UYVY:  return VIDEO_FORMAT_UYVY;
@@ -440,7 +445,6 @@ void DShowInput::OnVideoData(const VideoConfig &config,
 	frame.width      = config.cx;
 	frame.height     = config.cy;
 	frame.format     = ConvertVideoFormat(config.format);
-	frame.full_range = false;
 	frame.flip       = (config.format == VideoFormat::XRGB ||
 	                    config.format == VideoFormat::ARGB);
 
@@ -481,6 +485,10 @@ void DShowInput::OnVideoData(const VideoConfig &config,
 		frame.linesize[0] = cx;
 		frame.linesize[1] = cx;
 
+	} else if (videoConfig.format == VideoFormat::Y800) {
+		frame.data[0] = data;
+		frame.linesize[0] = cx;
+
 	} else {
 		/* TODO: other formats */
 		return;
@@ -502,21 +510,30 @@ void DShowInput::OnEncodedAudioData(enum AVCodecID id,
 		}
 	}
 
-	bool got_output;
-	int len = ffmpeg_decode_audio(audio_decoder, data, size,
-			&audio, &got_output);
-	if (len < 0) {
-		blog(LOG_WARNING, "Error decoding audio");
-		return;
-	}
+	do {
+		bool got_output;
+		int len = ffmpeg_decode_audio(audio_decoder, data, size,
+				&audio, &got_output);
+		if (len < 0) {
+			blog(LOG_WARNING, "Error decoding audio");
+			return;
+		}
 
-	if (got_output) {
-		audio.timestamp = (uint64_t)ts * 100;
+		if (got_output) {
+			audio.timestamp = (uint64_t)ts * 100;
 #if LOG_ENCODED_AUDIO_TS
-		blog(LOG_DEBUG, "audio ts: %llu", audio.timestamp);
+			blog(LOG_DEBUG, "audio ts: %llu", audio.timestamp);
 #endif
-		obs_source_output_audio(source, &audio);
-	}
+			obs_source_output_audio(source, &audio);
+		} else {
+			break;
+		}
+
+		ts += int64_t(audio_decoder->frame->nb_samples) * 10000000LL /
+			int64_t(audio_decoder->frame->sample_rate);
+		size -= (size_t)len;
+		data += len;
+	} while (size > 0);
 }
 
 void DShowInput::OnAudioData(const AudioConfig &config,
@@ -743,17 +760,24 @@ static DStr GetVideoFormatName(VideoFormat format);
 bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 {
 	string video_device_id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+	deactivateWhenNotShowing = obs_data_get_bool(settings, DEACTIVATE_WNS);
 	flip = obs_data_get_bool(settings, FLIP_IMAGE);
 
 	DeviceId id;
-	if (!DecodeDeviceId(id, video_device_id.c_str()))
+	if (!DecodeDeviceId(id, video_device_id.c_str())) {
+		blog(LOG_WARNING, "%s: DecodeDeviceId failed",
+			obs_source_get_name(source));
 		return false;
+	}
 
 	PropertiesData data;
 	Device::EnumVideoDevices(data.devices);
 	VideoDevice dev;
-	if (!data.GetDevice(dev, video_device_id.c_str()))
+	if (!data.GetDevice(dev, video_device_id.c_str())) {
+		blog(LOG_WARNING, "%s: data.GetDevice failed",
+			obs_source_get_name(source));
 		return false;
+	}
 
 	int resType = (int)obs_data_get_int(settings, RES_TYPE);
 	int cx = 0, cy = 0;
@@ -763,8 +787,11 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 	if (resType == ResType_Custom) {
 		bool has_autosel_val;
 		string resolution = obs_data_get_string(settings, RESOLUTION);
-		if (!ResolutionValid(resolution, cx, cy))
+		if (!ResolutionValid(resolution, cx, cy)) {
+			blog(LOG_WARNING, "%s: ResolutionValid failed",
+				obs_source_get_name(source));
 			return false;
+		}
 
 		has_autosel_val = obs_data_has_autoselect_value(settings,
 				FRAME_INTERVAL);
@@ -779,12 +806,16 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 
 		long long best_interval = numeric_limits<long long>::max();
 		bool video_format_match = false;
-		if (!CapsMatch(dev,
-			ResolutionMatcher(cx, cy),
-			VideoFormatMatcher(format, video_format_match),
-			ClosestFrameRateSelector(interval, best_interval),
-			FrameRateMatcher(interval)) && !video_format_match)
+		bool caps_match = CapsMatch(dev, ResolutionMatcher(cx, cy),
+				VideoFormatMatcher(format, video_format_match),
+				ClosestFrameRateSelector(interval, best_interval),
+				FrameRateMatcher(interval));
+
+		if (!caps_match && !video_format_match) {
+			blog(LOG_WARNING, "%s: Video format match failed",
+				obs_source_get_name(source));
 			return false;
+		}
 
 		interval = best_interval;
 	}
@@ -807,13 +838,19 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 	if (videoConfig.internalFormat != VideoFormat::MJPEG)
 		videoConfig.format = videoConfig.internalFormat;
 
-	if (!device.SetVideoConfig(&videoConfig))
+	if (!device.SetVideoConfig(&videoConfig)) {
+		blog(LOG_WARNING, "%s: device.SetVideoConfig failed",
+			obs_source_get_name(source));
 		return false;
+	}
 
 	if (videoConfig.internalFormat == VideoFormat::MJPEG) {
 		videoConfig.format = VideoFormat::XRGB;
-		if (!device.SetVideoConfig(&videoConfig))
+		if (!device.SetVideoConfig(&videoConfig)) {
+			blog(LOG_WARNING, "%s: device.SetVideoConfig (XRGB) "
+					"failed", obs_source_get_name(source));
 			return false;
+		}
 	}
 
 	DStr formatName = GetVideoFormatName(videoConfig.internalFormat);
@@ -957,13 +994,16 @@ inline bool DShowInput::Activate(obs_data_t *settings)
 	if (!device.ConnectFilters())
 		return false;
 
+	enum video_colorspace cs = GetColorSpace(settings);
+
+	video_range_type range = GetColorRange(settings);
+	frame.full_range = range == VIDEO_RANGE_FULL;
+
 	if (device.Start() != Result::Success)
 		return false;
 
-	enum video_colorspace cs = GetColorSpace(settings);
-
 	bool success = video_format_get_parameters(
-			cs, GetColorRange(settings),
+			cs, range,
 			frame.color_matrix,
 			frame.color_range_min,
 			frame.color_range_max);
@@ -1172,6 +1212,7 @@ static const VideoFormatName videoFormatNames[] = {
 	{VideoFormat::I420,  "I420"},
 	{VideoFormat::NV12,  "NV12"},
 	{VideoFormat::YV12,  "YV12"},
+	{VideoFormat::Y800,  "Y800"},
 
 	/* packed YUV formats */
 	{VideoFormat::YVYU,  "YVYU"},
@@ -1715,6 +1756,8 @@ static obs_properties_t *GetDShowProperties(void *obj)
 	obs_properties_add_button(ppts, "xbar_config", TEXT_CONFIG_XBAR,
 			CrossbarConfigClicked);
 
+	obs_properties_add_bool(ppts, DEACTIVATE_WNS, TEXT_DWNS);
+
 	/* ------------------------------------- */
 	/* video settings */
 
@@ -1761,14 +1804,15 @@ static obs_properties_t *GetDShowProperties(void *obj)
 	obs_property_list_add_int(p, TEXT_BUFFERING_OFF,
 			(int64_t)BufferingType::Off);
 
+	obs_property_set_long_description(p,
+			obs_module_text("Buffering.ToolTip"));
+
 	obs_properties_add_bool(ppts, FLIP_IMAGE, TEXT_FLIP_IMAGE);
 
 	/* ------------------------------------- */
 	/* audio settings */
 
 	Device::EnumAudioDevices(data->audioDevices);
-	if (!data->audioDevices.size())
-		return ppts;
 
 	p = obs_properties_add_list(ppts, AUDIO_OUTPUT_MODE, TEXT_AUDIO_MODE,
 			OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -1778,6 +1822,9 @@ static obs_properties_t *GetDShowProperties(void *obj)
 			(int64_t)AudioMode::DirectSound);
 	obs_property_list_add_int(p, TEXT_MODE_WAVEOUT,
 			(int64_t)AudioMode::WaveOut);
+
+	if (!data->audioDevices.size())
+		return ppts;
 
 	p = obs_properties_add_bool(ppts, USE_CUSTOM_AUDIO, TEXT_CUSTOM_AUDIO);
 
@@ -1811,6 +1858,22 @@ void DShowModuleLogCallback(LogType type, const wchar_t *msg, void *param)
 	UNUSED_PARAMETER(param);
 }
 
+static void HideDShowInput(void *data)
+{
+	DShowInput *input = reinterpret_cast<DShowInput*>(data);
+
+	if (input->deactivateWhenNotShowing && input->active)
+		input->QueueAction(Action::Deactivate);
+}
+
+static void ShowDShowInput(void *data)
+{
+	DShowInput *input = reinterpret_cast<DShowInput*>(data);
+
+	if (input->deactivateWhenNotShowing && input->active)
+		input->QueueAction(Action::Activate);
+}
+
 void RegisterDShowSource()
 {
 	SetLogCallback(DShowModuleLogCallback, nullptr);
@@ -1820,7 +1883,10 @@ void RegisterDShowSource()
 	info.type            = OBS_SOURCE_TYPE_INPUT;
 	info.output_flags    = OBS_SOURCE_VIDEO |
 	                       OBS_SOURCE_AUDIO |
-	                       OBS_SOURCE_ASYNC;
+	                       OBS_SOURCE_ASYNC |
+	                       OBS_SOURCE_DO_NOT_DUPLICATE;
+	info.show            = ShowDShowInput;
+	info.hide            = HideDShowInput;
 	info.get_name        = GetDShowInputName;
 	info.create          = CreateDShowInput;
 	info.destroy         = DestroyDShowInput;

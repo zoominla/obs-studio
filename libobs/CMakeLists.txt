@@ -13,6 +13,9 @@ endif()
 
 if(UNIX)
 	find_package(DBus QUIET)
+	if (NOT APPLE)
+		find_package(X11_XCB REQUIRED)
+	endif()
 else()
 	set(HAVE_DBUS "0")
 endif()
@@ -58,6 +61,20 @@ if(WIN32)
 		util/threading-windows.c
 		util/pipe-windows.c
 		util/platform-windows.c)
+	set(libobs_PLATFORM_HEADERS
+		util/threading-windows.h
+		util/windows/win-version.h
+		util/windows/ComPtr.hpp
+		util/windows/CoTaskMemPtr.hpp
+		util/windows/HRError.hpp
+		util/windows/WinHandle.hpp)
+	set(libobs_audio_monitoring_SOURCES
+		audio-monitoring/win32/wasapi-output.c
+		audio-monitoring/win32/wasapi-enum-devices.c
+		)
+	set(libobs_audio_monitoring_HEADERS
+		audio-monitoring/win32/wasapi-output.h
+		)
 	set(libobs_PLATFORM_DEPS winmm)
 	if(MSVC)
 		set(libobs_PLATFORM_DEPS
@@ -72,11 +89,14 @@ elseif(APPLE)
 		util/platform-nix.c
 		util/platform-cocoa.m)
 	set(libobs_PLATFORM_HEADERS
-		util/windows/win-version.h
-		util/windows/ComPtr.hpp
-		util/windows/CoTaskMemPtr.hpp
-		util/windows/HRError.hpp
-		util/windows/WinHandle.hpp)
+		util/threading-posix.h)
+	set(libobs_audio_monitoring_SOURCES
+		audio-monitoring/osx/coreaudio-enum-devices.c
+		audio-monitoring/osx/coreaudio-output.c
+		)
+	set(libobs_audio_monitoring_HEADERS
+		audio-monitoring/osx/mac-helpers.h
+		)
 
 	set_source_files_properties(${libobs_PLATFORM_SOURCES}
 		PROPERTIES
@@ -86,6 +106,18 @@ elseif(APPLE)
 	find_library(COCOA Cocoa)
 	mark_as_advanced(COCOA)
 	include_directories(${COCOA})
+
+	find_library(COREAUDIO CoreAudio)
+	mark_as_advanced(COREAUDIO)
+	include_directories(${COREAUDIO})
+
+	find_library(AUDIOTOOLBOX AudioToolbox)
+	mark_as_advanced(AUDIOTOOLBOX)
+	include_directories(${AUDIOTOOLBOX})
+
+	find_library(AUDIOUNIT AudioUnit)
+	mark_as_advanced(AUDIOUNIT)
+	include_directories(${AUDIOUNIT})
 
 	find_library(APPKIT AppKit)
 	mark_as_advanced(APPKIT)
@@ -101,6 +133,9 @@ elseif(APPLE)
 
 	set(libobs_PLATFORM_DEPS
 		${COCOA}
+		${COREAUDIO}
+		${AUDIOUNIT}
+		${AUDIOTOOLBOX}
 		${APPKIT}
 		${IOKIT}
 		${CARBON})
@@ -110,6 +145,11 @@ elseif(UNIX)
 		util/threading-posix.c
 		util/pipe-posix.c
 		util/platform-nix.c)
+	set(libobs_PLATFORM_HEADERS
+		util/threading-posix.h)
+	set(libobs_audio_monitoring_SOURCES
+		audio-monitoring/null/null-audio-monitoring.c
+		)
 
 	if(DBUS_FOUND)
 		set(libobs_PLATFORM_SOURCES ${libobs_PLATFORM_SOURCES}
@@ -119,6 +159,14 @@ elseif(UNIX)
 			${libobs_PLATFORM_DEPS}
 			${DBUS_LIBRARIES})
 	endif()
+
+	include_directories(
+		${X11_XCB_INCLUDE_DIRS})
+	add_definitions(
+		${X11_XCB_DEFINITIONS})
+	set(libobs_PLATFORM_DEPS
+		${libobs_PLATFORM_DEPS}
+		${X11_XCB_LIBRARIES})
 
 	if(${CMAKE_SYSTEM_NAME} MATCHES "FreeBSD")
 		# use the sysinfo compatibility library on bsd
@@ -162,7 +210,9 @@ set(libobs_graphics_SOURCES
 	graphics/axisang.c
 	graphics/vec4.c
 	graphics/vec2.c
+	graphics/libnsgif/libnsgif.c
 	graphics/texture-render.c
+	graphics/image-file.c
 	graphics/bounds.c
 	graphics/matrix3.c
 	graphics/matrix4.c
@@ -184,7 +234,9 @@ set(libobs_graphics_HEADERS
 	graphics/matrix4.h
 	graphics/graphics.h
 	graphics/graphics-internal.h
+	graphics/libnsgif/libnsgif.h
 	graphics/device-exports.h
+	graphics/image-file.h
 	graphics/vec2.h
 	graphics/vec4.h
 	graphics/matrix3.h
@@ -212,7 +264,8 @@ set(libobs_mediaio_HEADERS
 	media-io/format-conversion.h
 	media-io/audio-resampler.h
 	media-io/video-scaler.h
-	media-io/media-remux.h)
+	media-io/media-remux.h
+	media-io/frame-rate.h)
 
 set(libobs_util_SOURCES
 	util/array-serializer.c
@@ -241,6 +294,7 @@ set(libobs_util_HEADERS
 	util/vc/vc_stdint.h
 	util/bmem.h
 	util/c99defs.h
+	util/util_uint128.h
 	util/cf-parser.h
 	util/threading.h
 	util/pipe.h
@@ -262,6 +316,8 @@ set(libobs_libobs_SOURCES
 	obs-encoder.c
 	obs-service.c
 	obs-source.c
+	obs-source-deinterlace.c
+	obs-source-transition.c
 	obs-output.c
 	obs-output-delay.c
 	obs.c
@@ -273,6 +329,7 @@ set(libobs_libobs_SOURCES
 	obs-display.c
 	obs-view.c
 	obs-scene.c
+	obs-audio.c
 	obs-video.c)
 set(libobs_libobs_HEADERS
 	${libobs_PLATFORM_HEADERS}
@@ -309,7 +366,10 @@ set(libobs_HEADERS
 	${libobs_graphics_HEADERS}
 	${libobs_mediaio_HEADERS}
 	${libobs_util_HEADERS}
-	${libobs_libobs_HEADERS})
+	${libobs_libobs_HEADERS}
+	${libobs_audio_monitoring_SOURCES}
+	${libobs_audio_monitoring_HEADERS}
+	)
 
 source_group("callback\\Source Files" FILES ${libobs_callback_SOURCES})
 source_group("callback\\Header Files" FILES ${libobs_callback_HEADERS})
@@ -321,7 +381,15 @@ source_group("media-io\\Source Files" FILES ${libobs_mediaio_SOURCES})
 source_group("media-io\\Header Files" FILES ${libobs_mediaio_HEADERS})
 source_group("util\\Source Files" FILES ${libobs_util_SOURCES})
 source_group("util\\Header Files" FILES ${libobs_util_HEADERS})
+source_group("audio-monitoring\\Source Files" FILES ${libobs_audio_monitoring_SOURCES})
+source_group("audio-monitoring\\Header Files" FILES ${libobs_audio_monitoring_HEADERS})
 
+if(BUILD_CAPTIONS)
+	include_directories(${CMAKE_SOURCE_DIR}/deps/libcaption)
+	set(libobs_PLATFORM_DEPS
+		${libobs_PLATFORM_DEPS}
+		caption)
+endif()
 
 add_library(libobs SHARED ${libobs_SOURCES} ${libobs_HEADERS})
 
